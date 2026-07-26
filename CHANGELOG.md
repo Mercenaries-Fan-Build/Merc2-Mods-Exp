@@ -2,6 +2,38 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.5.2] - 2026-07-26
+
+Only `lua-bridge-DEV` bumped (0.5.1 → 0.5.2). **Framerate regression fix — anyone on v0.5.0 or v0.5.1 should update.** No API changes, no config changes.
+
+### Fixed
+
+- **The first Lua chunk of a session could permanently halve the framerate.** Reported as "60 fps stable, then the moment any Lua runs it drops to ~25 and never recovers" — and it reproduced on `return 1+1`, a chunk that touches no engine function at all, which is what ruled out the script being executed as the cause. Three defects chained:
+
+  1. **The watchdog fired on the very first chunk.** `g_lastPumpProgressTick` only advanced when a chunk actually *drained*, so after any idle period it read as a stall. A REPL sitting unused for three minutes after boot — the normal case — made the first chunk queued look like a 186-second hang. Its own diagnostic said so: `since_progress=186047ms` with `PendingScripts=1`. **This defect dates to v0.2.2** and had always misfired; it was invisible because the reset then cost only one re-capture cycle.
+
+  2. **The watchdog's reset counterfeited a "new VM" event.** That reset clears `g_seenL` by design, to force a clean re-capture. But v0.5.0's main-menu re-arm keys off "a `lua_State` not in `g_seenL`" — so wiping the set made the VM the bridge had been using for minutes look brand new, and the re-arm fired.
+
+  3. **The re-arm re-enabled a scan with no reachable exit.** It clears `g_OnLoadTriggered`, which switches `DetourNoopStub` back to joining and substring-scanning every captured log line, waiting for `"GlobalExit - Complete"`. With the level already loaded that milestone cannot reappear without a real level load, so the scan ran forever — `m2_lua_join_strings` plus a 21-entry ladder match, on a stub that fires thousands of times per frame.
+
+  Fixed at all three layers:
+  - The stall clock now starts when work **arrives** (the empty→non-empty transition in `InQueuePush`), so `since_progress` measures how long a chunk has actually been waiting. Only on the transition — resetting it on every push would let a steady stream of chunks mask a genuine stall.
+  - The re-arm now tests a separate `g_everSeenL` table that **nothing ever clears**, so a watchdog reset can no longer forge a load-cycle event. It fails safe when full: a missed re-arm costs one stale OnLoad, a false one costs the framerate.
+  - A 60-second ceiling on the milestone scan, after which it disables itself and logs why. A real load reaches the milestone in seconds, so this cannot truncate a legitimate one. Defence in depth — it did not engage during verification, which is the point.
+
+### Verification
+
+Reproduced and fixed against a clean boot (PC restarted, game idle two minutes before the first chunk — the idle gap is what arms the bug):
+
+| | v0.5.1 | v0.5.2 |
+|---|--:|--:|
+| Watchdog fires | 1 | **0** |
+| Spurious re-arms | 1 | **0** |
+| OnKey rescans | 1 | **0** |
+| Framerate after first chunk | 60 → ~25, permanent | **60, stable** |
+
+Escalated afterwards with framerate held at 60 throughout: 9 pure-Lua chunks, then a first engine native (`Player.GetCash`), then the Ess framework layer, then an object spawn — the call originally suspected. The 60-second scan ceiling never engaged, confirming the two root-cause fixes carry it on their own.
+
 ## [v0.5.1] - 2026-07-26
 
 Only `lua-bridge-DEV` bumped (0.5.0 → 0.5.1). Two transport-layer correctness fixes, both found by reading the consumers rather than the bridge. No API changes, no config changes.

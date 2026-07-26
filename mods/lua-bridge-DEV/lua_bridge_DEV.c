@@ -667,7 +667,24 @@ static void InQueuePush(const char* code, size_t len, int from_ws, LONG session)
     g_inQueue_tail = node;
     LeaveCriticalSection(&g_inMtx);
 
-    InterlockedIncrement(&g_PendingScripts);
+    /* Start the stall clock when work ARRIVES, not from the last drain.
+     *
+     * g_lastPumpProgressTick only advanced when a chunk actually drained, so
+     * after a quiet period it reads as "no progress for N seconds" even
+     * though nothing was ever waiting. A REPL sitting idle for three minutes
+     * after boot -- the normal case -- then made the very FIRST chunk queued
+     * look like a 186-second stall, and the watchdog fired on it instantly.
+     * Measured exactly that: `since_progress=186047ms` on the first chunk of
+     * a fresh session.
+     *
+     * Setting it here on the empty->non-empty transition makes since_progress
+     * mean "how long has this chunk been waiting", which is the question the
+     * watchdog is actually asking. Only on the transition: doing it on every
+     * push would let a steady stream of chunks reset the clock forever and
+     * mask a genuine stall. */
+    if (InterlockedIncrement(&g_PendingScripts) == 1) {
+        g_lastPumpProgressTick = GetTickCount();
+    }
     g_hotWork = 1;
 }
 
@@ -1199,6 +1216,40 @@ static __inline void GatedPump(void* L_arg0) {
 static void* g_seenL[SEEN_L_SLOTS] = {0};
 static int   g_seenLNext = 0;   /* ring cursor — where the next eviction writes */
 
+/* A SEPARATE record of every lua_State this process has ever captured, used
+ * ONLY to decide whether a VM is genuinely new.
+ *
+ * Why it can't just read g_seenL: the watchdog's reset deliberately wipes
+ * g_seenL to force a clean re-capture. That makes an L the bridge has been
+ * using for minutes look brand new, and the load-cycle re-arm keyed off
+ * exactly that signal — so a single watchdog fire manufactured a counterfeit
+ * "the player went to the menu and came back" event. The consequence was not
+ * subtle: the re-arm clears g_OnLoadTriggered, which re-enables the
+ * per-log-line join + phase scan in DetourNoopStub, and that only ever turns
+ * off again when the "GlobalExit - Complete" milestone reappears — which
+ * cannot happen without a real level load. The result was a permanent
+ * thousands-of-times-per-frame cost: 60 fps to ~25, with no recovery.
+ *
+ * This array is never cleared by anything. It is only ever appended to and
+ * only ever compared against. */
+#define EVER_SEEN_L_SLOTS 32
+static void* g_everSeenL[EVER_SEEN_L_SLOTS] = {0};
+static int   g_everSeenLCount = 0;
+
+/* Has this L ever been captured before? Records it if not. */
+static int EverSeenL_CheckAndAdd(void* L) {
+    int i;
+    for (i = 0; i < g_everSeenLCount; ++i) {
+        if (g_everSeenL[i] == L) return 1;
+    }
+    if (g_everSeenLCount < EVER_SEEN_L_SLOTS) {
+        g_everSeenL[g_everSeenLCount++] = L;
+    }
+    /* Table full: report "seen before" so we fail SAFE. A missed re-arm costs
+     * one stale OnLoad; a false re-arm costs the framerate. */
+    return (g_everSeenLCount >= EVER_SEEN_L_SLOTS) ? 1 : 0;
+}
+
 /* Loader once-per-load-cycle guards. File-scope rather than function-local
  * statics so RearmLoaderForNewLoadCycle() can clear them on a menu return. */
 static volatile LONG g_keyLoaderInitialized = 0;
@@ -1259,8 +1310,16 @@ static void CaptureL(void* L, const char* via) {
      * BEFORE OnLoad has executed (confirmed in the logs), so the
      * g_OnLoadExecuted guard excludes it. Must run before the two blocks
      * below, since it clears the guards they test. */
-    if (g_loader_enabled && g_loader_rearm_on_menu && g_OnLoadExecuted) {
-        RearmLoaderForNewLoadCycle("fresh Lua VM after a completed load");
+    /* Only re-arm for a VM this process has genuinely never seen. Checked
+     * against g_everSeenL, NOT g_seenL — the watchdog wipes the latter, and
+     * keying off it turned every watchdog fire into a fake load-cycle event.
+     * See the comment on g_everSeenL. Call once: it records as it checks. */
+    {
+        int seen_before = EverSeenL_CheckAndAdd(L);
+        if (g_loader_enabled && g_loader_rearm_on_menu && g_OnLoadExecuted &&
+            !seen_before) {
+            RearmLoaderForNewLoadCycle("fresh Lua VM after a completed load");
+        }
     }
 
     if (g_loader_enabled && !g_keyLoaderInitialized) {
@@ -1359,10 +1418,42 @@ static int __cdecl DetourNoopStub(void* L) {
      * unconditionally for phase tracking and cost ~2 FPS; measured, not
      * theorized. Do not make this unconditional again. */
     {
+        /* HARD BOUND on how long this scan may stay enabled. Both gates below
+         * switch off when their milestone arrives — but if that milestone
+         * never comes, they would scan every log line forever, and this stub
+         * fires thousands of times per frame.
+         *
+         * That is not hypothetical: a spurious re-arm once cleared
+         * g_OnLoadTriggered while the level was ALREADY loaded, so the
+         * "GlobalExit - Complete" line it was waiting for could not reappear
+         * without a real level load. Framerate went to ~25 and stayed there.
+         * The root causes are fixed (see g_everSeenL and InQueuePush), but a
+         * cost this large should not depend solely on those being right.
+         *
+         * A real load reaches the milestone in seconds, so a 60s ceiling
+         * cannot cut a legitimate load short. */
+        static DWORD scan_started_tick = 0;
+        static int   scan_gave_up      = 0;
         int want_phase  = (g_loader_track_phase &&
                            g_loadPhase < M2_PHASE_REACHED_WORLD_IDX);
         int want_onload = (g_loader_enabled && g_loader_onload &&
                            !g_OnLoadTriggered);
+
+        if (!(want_phase || want_onload)) {
+            scan_started_tick = 0;      /* settled — re-arm the budget */
+            scan_gave_up      = 0;
+        } else if (scan_gave_up) {
+            want_phase = want_onload = 0;
+        } else if (scan_started_tick == 0) {
+            scan_started_tick = GetTickCount();
+        } else if ((GetTickCount() - scan_started_tick) > 60000) {
+            scan_gave_up = 1;
+            want_phase = want_onload = 0;
+            m2_logf("[!] lua_bridge: load-milestone scan ran 60s without reaching "
+                    "GlobalExit — disabling it to protect the frame budget "
+                    "(phase=%d OnLoadTriggered=%d). A real level load will "
+                    "re-enable it.", (int)g_loadPhase, (int)g_OnLoadTriggered);
+        }
 
         if (want_phase || want_onload) {
             char msg[512];
