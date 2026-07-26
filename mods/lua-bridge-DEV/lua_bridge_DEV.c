@@ -460,10 +460,32 @@ static size_t g_outBuf_cap   = 0;
  * client. from_ws=0 covers raw-TCP submissions and loader-initiated
  * OnKey/OnBoot/OnLoad scripts (both still write results to g_outBuf,
  * matching the prior v0.4.0 behavior). */
+/* Identifies WHICH raw-TCP session submitted a chunk, so its result can only
+ * ever be delivered back to that same session. 0 means "no raw-TCP requester"
+ * (a WebSocket submission, or a loader-fired OnKey/OnBoot/OnLoad script).
+ *
+ * This is what fixes the long-standing "socket output is one execution behind"
+ * behavior that made tools/lua_repl.py abandon the socket as a result channel.
+ * The accept-time g_outBuf clear (v0.4.0) could not fix it, because the race is
+ * not stale-data-at-accept — it is a result arriving AFTER the next client has
+ * already connected:
+ *
+ *     conn A submits chunk N, reads [queued], disconnects
+ *     conn B is accepted        -> g_outBuf cleared (nothing pending yet)
+ *     the pump finally runs N   -> result_N appended to g_outBuf
+ *     conn B's flush            -> B receives A's result, then its own
+ *
+ * B then reads to the first <<<END>>> and gets the previous chunk's answer:
+ * exactly one execution behind, forever, for every subsequent request.
+ * Incrementing this on every accept makes a stale result fail the match in
+ * PumpQueue and be dropped instead of misdelivered. */
+static volatile LONG g_rawSessionId = 0;
+
 typedef struct ChunkNode {
     char*  code;
     size_t len;
     int    from_ws;
+    LONG   session;   /* g_rawSessionId at submit time; 0 = not raw-TCP */
     struct ChunkNode* next;
 } ChunkNode;
 static CRITICAL_SECTION g_inMtx;
@@ -627,7 +649,7 @@ static void OutAppend(const char* s, size_t s_len) {
 /* ------------------------------------------------------------------------ *
  * Input-queue helpers
  * ------------------------------------------------------------------------ */
-static void InQueuePush(const char* code, size_t len, int from_ws) {
+static void InQueuePush(const char* code, size_t len, int from_ws, LONG session) {
     ChunkNode* node = (ChunkNode*)malloc(sizeof(ChunkNode));
     if (!node) return;
     node->code = (char*)malloc(len + 1);
@@ -636,6 +658,7 @@ static void InQueuePush(const char* code, size_t len, int from_ws) {
     node->code[len] = '\0';
     node->len     = len;
     node->from_ws = from_ws;
+    node->session = session;
     node->next    = NULL;
 
     EnterCriticalSection(&g_inMtx);
@@ -1103,14 +1126,32 @@ static void PumpQueue(void* L_for_exec) {
         g_bridgeExecStartTick = 0;
 
         m2_logf("[+] lua_bridge: Script executed. Result: %s", result_buf);
-        /* Only fan out to the raw-TCP result channel (g_outBuf) for
-         * chunks that came from raw TCP or the loader. WS-queued
-         * chunks return their results via Loader.WsSend from the Lua
-         * wrapper; writing to g_outBuf here would spray them at any
-         * concurrently-connected raw-TCP client as unsolicited noise. */
-        if (!node->from_ws) {
+        /* Deliver to the raw-TCP result channel ONLY if this chunk was
+         * submitted by the session that is still connected. Two cases are now
+         * dropped instead of being written into g_outBuf:
+         *
+         *   session != current  the requester disconnected while its chunk was
+         *                       still queued. Writing the result now would hand
+         *                       it to whoever connected next, who would read it
+         *                       as the answer to THEIR request and stay one
+         *                       execution behind from then on.
+         *   session == 0        a WS submission (answered over Loader.WsSend)
+         *                       or a loader-fired OnKey/OnBoot/OnLoad script,
+         *                       which nobody asked for over this socket.
+         *
+         * NOTE: dropping the loader case is a deliberate behavior change from
+         * v0.4.1, where OnKey results were written to g_outBuf. Pressing a
+         * hotkey while a REPL was connected injected an unsolicited result into
+         * that client's stream — the same desync by a different route. Loader
+         * results still go to the log and to the WS {type:"log"} feed. */
+        if (!node->from_ws && node->session != 0 &&
+            node->session == g_rawSessionId) {
             OutAppend(result_buf, strlen(result_buf));
             OutAppend("<<<END>>>", 9);
+        } else if (!node->from_ws && node->session != 0) {
+            m2_logf("[*] lua_bridge: dropped result for session %ld (client gone; "
+                    "current session %ld) — not delivering to another client",
+                    (long)node->session, (long)g_rawSessionId);
         }
         ChunkNodeFree(node);
 
@@ -2432,7 +2473,7 @@ static DWORD WINAPI LoaderKeyThread(LPVOID param) {
                             if (code) {
                                 m2_logf("[*] lua_bridge: OnKey hotkey '%s' pressed. Queuing script %s",
                                         g_KeyScripts[i].key_name, g_KeyScripts[i].rel_path);
-                                InQueuePush(code, code_len, 0);
+                                InQueuePush(code, code_len, 0, 0);   /* session 0 — loader-fired, not a REPL request */
                                 free(code);
                             }
                         }
@@ -3417,6 +3458,10 @@ MATH_ONEARG(Sqrt,  sqrtf)
 MATH_ONEARG(Log,   logf)
 MATH_ONEARG(Log10, log10f)
 
+/* Metres to yards. Every distance the engine hands you is metric. */
+static float FreedomUnitsConv(float m) { return m * 1.09361f; }
+MATH_ONEARG(FreedomUnits, FreedomUnitsConv)
+
 MATH_TWOARG(Atan2, atan2f)
 MATH_TWOARG(Fmod,  fmodf)
 
@@ -3556,6 +3601,7 @@ static const luaL_Reg math_lib[] = {
     {"frexp",      LuaMathFrexp},
     {"random",     LuaMathRandom},
     {"randomseed", LuaMathRandomseed},
+    {"FreedomUnits", LuaMathFreedomUnits},
     {NULL, NULL}
 };
 
@@ -3575,7 +3621,14 @@ static void RegisterMathLib(void* L) {
         : "edx", "memory"
     );
     static int logged = 0;
-    if (!logged) { logged = 1; m2_logf("[*] lua_bridge: Registered 19 math.* functions globally"); }
+    if (!logged) {
+        /* Counted from the table rather than hardcoded — the literal had
+         * already gone stale once. */
+        int n = 0;
+        while (math_lib[n].name) n++;
+        logged = 1;
+        m2_logf("[*] lua_bridge: Registered %d math.* functions globally", n);
+    }
 }
 
 /* ------------------------------------------------------------------------ *
@@ -4129,6 +4182,31 @@ static int js_escape_into(const char* src, size_t src_len, char** dst, char* dst
             if (d + 6 > dst_end) return 0;
             _snprintf_s(d, 7, _TRUNCATE, "\\u%04x", ch);
             d += 6;
+        } else if (ch >= 0x80) {
+            /* High bytes must be escaped, not passed through. A WebSocket
+             * TEXT frame is required to carry valid UTF-8 (RFC 6455 §5.6), and
+             * the strings we broadcast are single-byte CP1252 — the engine's
+             * text encoding. Emitting a lone 0xF6 produces malformed UTF-8,
+             * and a conforming browser closes the connection with protocol
+             * error 1007 rather than showing you the line. Escaping as \\uXXXX
+             * keeps the frame pure ASCII and therefore always valid.
+             *
+             * The mapping matters: CP1252 0x80-0x9F is NOT Latin-1. Byte 0x92
+             * is a right single quote (U+2019), not U+0092, so a naive
+             * \\u00XX would turn every apostrophe the engine emits into an
+             * invisible control character. 0xA0-0xFF is genuinely Latin-1 and
+             * maps to the same codepoint. Raw TCP is unaffected — it is a byte
+             * stream with no encoding contract. */
+            static const unsigned short kCp1252High[32] = {
+                0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+                0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+            };
+            unsigned int cp = (ch < 0xA0) ? kCp1252High[ch - 0x80] : ch;
+            if (d + 6 > dst_end) return 0;
+            _snprintf_s(d, 7, _TRUNCATE, "\\u%04x", cp);
+            d += 6;
         } else {
             if (d + 1 > dst_end) return 0;
             *d++ = (char)ch;
@@ -4178,7 +4256,14 @@ static void ws_remove_client(SOCKET c) {
  * we visit each index at most once regardless of what gets pruned.
  * ------------------------------------------------------------------------ */
 static void ws_broadcast_typed_line(const char* type, const char* line, size_t line_len) {
-    char buf[2560];              /* enough for a full 2 KB Loader.Printf line + envelope */
+    /* Sized for the WORST CASE of js_escape_into, not the typical one. Since
+     * v0.5.1 every byte >= 0x80 expands to a 6-char \uXXXX escape, so a full
+     * 2 KB Loader.Printf line of accented text needs 6x its length. At the old
+     * 2560 the escape would have hit dst_end, returned 0, and this function
+     * would have silently dropped the entire line — a worse failure than the
+     * malformed frame it replaced. Stack cost matches PumpQueue's existing
+     * 16 KB result_buf on the same thread. */
+    char buf[(2048 * 6) + 128];
     char* d = buf;
     char* de = buf + sizeof(buf);
     size_t prefix_len;
@@ -4278,7 +4363,7 @@ static void ws_serve_client(SOCKET c) {
             continue;
         }
 
-        InQueuePush(code, strlen(code), 1);       /* from_ws=1 — skip g_outBuf fanout */
+        InQueuePush(code, strlen(code), 1, 0);    /* from_ws=1 — skip g_outBuf fanout */
         /* %lu not %zu — wvsprintfA drops %z and printed the literal "zu". */
         m2_logf("[+] lua_bridge: ws: queued chunk (id=%s, %lu bytes)",
                 id, (unsigned long)strlen(code));
@@ -4388,9 +4473,18 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
         const char* nl;
         const char* p;
         size_t rx_len = 0;
+        LONG   my_session;
 
         c = accept(srv, NULL, NULL);
         if (c == INVALID_SOCKET) continue;
+
+        /* Claim a new session id. Any chunk still queued from a previous
+         * client now carries a stale id, so PumpQueue drops its result rather
+         * than delivering it here. Together with the buffer clear below this
+         * closes both halves of the one-execution-behind bug: the clear
+         * handles output already sitting in the buffer, the id handles output
+         * that has not been produced yet. */
+        my_session = InterlockedIncrement(&g_rawSessionId);
 
         /* Discard any pending raw-TCP output that leaked in from a
          * previous session. The bridge is single-client, so anything
@@ -4484,7 +4578,7 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
                     if (chunk_len > 0) {
                         m2_logf("[+] lua_bridge: queued chunk (%lu bytes)",
                                 (unsigned long)chunk_len);
-                        InQueuePush(chunk_buf, chunk_len, 0);
+                        InQueuePush(chunk_buf, chunk_len, 0, my_session);
                         OutAppend("[queued]", 8);
                     }
                     chunk_len = 0;

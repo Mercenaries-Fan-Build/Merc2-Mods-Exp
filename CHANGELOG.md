@@ -2,6 +2,41 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.5.1] - 2026-07-26
+
+Only `lua-bridge-DEV` bumped (0.5.0 → 0.5.1). Two transport-layer correctness fixes, both found by reading the consumers rather than the bridge. No API changes, no config changes.
+
+### Fixed
+
+- **The raw-TCP result channel was one execution behind.** Long-standing enough that `mercs2-lua-essentials`' `tools/lua_repl.py` was rewritten around it — that tool abandoned the socket as a result channel entirely, treating it as "advisory, possibly stale" and reading results back out of the log instead. Root cause: `g_outBuf` carried no association between a result and the connection that asked for it, and the executor's results are produced asynchronously on the game thread. The v0.4.0 accept-time buffer clear could not fix it, because the race isn't stale-data-at-accept — it's a result arriving *after* the next client has already connected:
+
+  ```
+  conn A submits chunk N, reads [queued], disconnects
+  conn B is accepted        -> g_outBuf cleared (nothing pending yet)
+  the pump finally runs N   -> result_N appended to g_outBuf
+  conn B's flush            -> B receives A's result, then its own
+  ```
+
+  B reads to the first `<<<END>>>`, gets the previous chunk's answer, and stays exactly one execution behind for every subsequent request on that connection. Fixed by tagging each queued chunk with the raw-TCP session id that submitted it (incremented per `accept`) and delivering a result only when that session is still connected. A result whose requester has gone is dropped and logged rather than misdelivered.
+  - Verified live by reproduction: four chunks submitted with the `lua_repl.py` close-early pattern produced two `dropped result for session N (client gone; current session N+1)` lines — the exact condition that used to cause the misdelivery — with zero cross-request leakage.
+  - **Behavior change:** OnKey/OnBoot/OnLoad results no longer reach the raw-TCP channel. Pressing a hotkey while a REPL was connected used to inject an unsolicited result into that client's stream, which is the same desync by another route. Loader results still go to `lua_bridge_DEV.log` and to the WebSocket `{type:"log"}` feed.
+
+- **WebSocket text frames could carry invalid UTF-8.** `js_escape_into` escaped control characters but passed bytes `0x80`–`0xFF` through untouched. The strings the bridge broadcasts are single-byte CP1252 (the engine's text encoding), so any accented character produced a malformed TEXT frame — and RFC 6455 §5.6 requires TEXT payloads to be valid UTF-8, so a conforming browser is entitled to fail the connection with protocol error 1007 rather than display the line. High bytes are now emitted as `\uXXXX`, which keeps the frame pure ASCII and therefore always valid.
+  - The mapping is the real CP1252 one, not a naive `\u00XX`: byte `0x92` is a right single quote (U+2019), not U+0092, so the naive form would have turned every apostrophe the engine emits into an invisible control character. `0xA0`–`0xFF` is genuine Latin-1 and maps to the same codepoint.
+  - Also resized the broadcast buffer. At the old 2560 bytes — sized for 1:1 passthrough — a 2 KB line of accented text would have exceeded the destination, and `js_escape_into` returning 0 causes the broadcaster to drop the **entire line**. That would have been a worse failure than the malformed frame it replaced.
+  - Raw TCP is unaffected either way; it's a byte stream with no encoding contract.
+  - Verified live over a real WebSocket handshake: `0xF6 → ö`, `0x92 → ’`, frames decode as valid UTF-8 and parse as valid JSON.
+
+### Known gap (not shipping-blocking)
+
+`mercs2-lua-essentials`' `tools/test_bridge_client.js` contains a deliberate line-for-line port of `js_escape_into`, so the two failing to agree makes the test fail. That port still says "everything else passes through" and no test input uses a high byte, so it no longer mirrors the C and would not catch a future regression in high-byte escaping. The C is correct and verified; the stale mirror lives in another repo and is tracked there.
+
+### Verification
+
+- Reproduction harness for the off-by-one: 4 close-early submissions + 1 normal request, zero leakage, drop path confirmed firing.
+- Minimal stdlib WebSocket client for the framing fix: handshake, frame decode, UTF-8 and JSON validation, CP1252 mapping spot-checks.
+- Ess framework smoke suite re-run against the rebuilt bridge: **49/49**.
+
 ## [v0.5.0] - 2026-07-25
 
 Only `lua-bridge-DEV` bumped (0.4.1 → 0.5.0). Version-family boundary: `v0.5` is a **reliability pass on the loader half** of the mod, which had not had the same scrutiny as the bridge half. Most of what follows was found by driving a live session over the REPL rather than by reading the source, and several are long-standing bugs rather than new features. Every behavior change ships with an ini lever that restores the pre-0.5.0 behavior.
