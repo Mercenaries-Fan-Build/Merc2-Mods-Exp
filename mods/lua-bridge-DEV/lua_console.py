@@ -19,6 +19,10 @@ Features:
 
 Protocol matches lua_repl.py / dllmain.cpp's BridgeServerThread:
   send `<your chunk>\n<<<RUN>>>\n`, read until `<<<END>>>`.
+
+Wire encoding is CP1252, not UTF-8 — the engine's text path is single-byte.
+See execute_chunk(). Note also that this build of Lua parses `"\ddd"` byte
+escapes as OCTAL, not decimal: o-umlaut is `"\366"`, not `"\246"`.
 """
 from __future__ import annotations
 
@@ -270,7 +274,12 @@ def execute_chunk(host: str, port: int, code: str) -> str:
     s.settimeout(EXEC_TIMEOUT_S)
     try:
         payload = code.rstrip("\n") + "\n" + SENTINEL + "\n"
-        s.sendall(payload.encode("utf-8"))
+        # cp1252, not utf-8. The engine's text renderers consume strings as
+        # single-byte CP1252, so sending UTF-8 puts two bytes where the
+        # renderer wants one and "Möbius" arrives as "MÃ¶bius". Characters
+        # with no CP1252 equivalent become "?" rather than raising, so a
+        # stray emoji in a comment can't kill the send.
+        s.sendall(payload.encode("cp1252", errors="replace"))
         buf = ""
         deadline = time.monotonic() + EXEC_TIMEOUT_S
         while time.monotonic() < deadline:
@@ -280,7 +289,9 @@ def execute_chunk(host: str, port: int, code: str) -> str:
                 return buf + f"\n[bridge] no <<<END>>> after {EXEC_TIMEOUT_S:.0f}s\n"
             if not chunk:
                 break
-            buf += chunk.decode("utf-8", errors="replace")
+            # Decode the same way, so a high byte the engine sent back renders
+            # as the character it actually represents in-game.
+            buf += chunk.decode("cp1252", errors="replace")
             if END_MARKER in buf:
                 return buf.replace(END_MARKER, "").rstrip("\n") + "\n"
         return buf or "[bridge] empty response\n"

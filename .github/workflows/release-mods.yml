@@ -52,14 +52,20 @@ jobs:
           # repo as documentation — users copy them by hand if wanted.
           mkdir -p dist/lua-bridge-pkg
 
+          # NOTE: lua_loader.ini is deliberately NOT shipped as of v0.5.0.
+          # EnsureLoaderIniHeader() writes a fully commented lua_loader.ini
+          # (key-name reference, ordering rules) on first run — but only if
+          # the file doesn't already exist. Shipping a copy meant users got a
+          # bare stub referencing sample scripts that aren't in the zip, and
+          # never saw the documentation the code goes out of its way to
+          # generate. Letting it auto-generate is strictly better. The repo
+          # copy stays as documentation, same as the sample .lua files.
           cp mods/lua-bridge-DEV/lua_bridge_DEV.asi dist/
           cp mods/lua-bridge-DEV/lua_bridge_DEV.ini dist/
-          cp mods/lua-bridge-DEV/lua_loader.ini dist/
           cp mods/lua-bridge-DEV/lua_console.py dist/
 
           cp mods/lua-bridge-DEV/lua_bridge_DEV.asi dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_bridge_DEV.ini dist/lua-bridge-pkg/
-          cp mods/lua-bridge-DEV/lua_loader.ini dist/lua-bridge-pkg/
           cp mods/lua-bridge-DEV/lua_console.py dist/lua-bridge-pkg/
 
           cd dist/lua-bridge-pkg

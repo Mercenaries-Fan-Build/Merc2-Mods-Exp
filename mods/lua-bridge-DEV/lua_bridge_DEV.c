@@ -252,7 +252,13 @@ static const LuaRvaSet* SelectRvas(HMODULE mod) {
         return &kRvas_v1_1;
     }
     fp = Fnv1a64(base + 0x11000, 0x1000);
-    m2_logf("[*] lua_bridge: binary fingerprint = 0x%016llX", fp);
+    /* Split into two 32-bit halves: m2_logf goes through wvsprintfA, which
+     * supports neither %ll nor a width specifier and silently emitted the
+     * literal text "0xlX" instead of the hash. That mattered — the header
+     * comment above tells you to read this value off the log to add support
+     * for a new binary, and it never once printed. */
+    m2_logf("[*] lua_bridge: binary fingerprint = 0x%08lX%08lX",
+            (unsigned long)(fp >> 32), (unsigned long)(fp & 0xFFFFFFFFu));
 
     switch (fp) {
         case 0xB79E4DD22A4BFCB3ULL:
@@ -322,11 +328,22 @@ typedef struct FixedTString {
 #pragma pack(pop)
 static FixedTString g_chunkSource;
 
+/* Second source buffer, used only by Loader.LoadFile. LoadFile runs a chunk
+ * from inside a C function that is itself executing out of g_chunkSource, so
+ * sharing one buffer would clobber the caller's source mid-flight. */
+static FixedTString g_loadFileChunkSource;
+static int          g_loadFileDepth = 0;
+
 static void InitChunkSource(void) {
     memset(&g_chunkSource, 0, sizeof(g_chunkSource));
     g_chunkSource.tt     = (uint8_t)LUA_TSTRING;
     g_chunkSource.marked = 0x20 | 0x01;  /* FIXEDBIT | WHITE0BIT */
     g_chunkSource.hash   = 0xDEADBEEF;
+
+    memset(&g_loadFileChunkSource, 0, sizeof(g_loadFileChunkSource));
+    g_loadFileChunkSource.tt     = (uint8_t)LUA_TSTRING;
+    g_loadFileChunkSource.marked = 0x20 | 0x01;
+    g_loadFileChunkSource.hash   = 0x10ADF11E;  /* "loadfile"-ish, arbitrary */
 }
 
 /* Fixed-size TString for Loader.GetKeyboardState()'s return value.
@@ -386,6 +403,30 @@ static void InitKeyEventsTString(void) {
     g_keyEventsTString.marked = 0x20 | 0x01;  /* FIXEDBIT | WHITE0BIT */
     g_keyEventsTString.hash   = 0x45564553;   /* "EVES" */
     g_keyEventsTString.len    = 0;
+}
+
+/* Companion TString for the name half of Loader.GetLoadPhase(). Same
+ * reuse semantics as the two above: valid until the next call. */
+#pragma pack(push, 4)
+typedef struct PhaseNameTString {
+    void*    next;
+    uint8_t  tt;
+    uint8_t  marked;
+    uint8_t  reserved;
+    uint8_t  _pad;
+    uint32_t hash;
+    uint32_t len;
+    char     data[64];
+} PhaseNameTString;
+#pragma pack(pop)
+static PhaseNameTString g_phaseNameTString;
+
+static void InitPhaseNameTString(void) {
+    memset(&g_phaseNameTString, 0, sizeof(g_phaseNameTString));
+    g_phaseNameTString.tt     = (uint8_t)LUA_TSTRING;
+    g_phaseNameTString.marked = 0x20 | 0x01;  /* FIXEDBIT | WHITE0BIT */
+    g_phaseNameTString.hash   = 0x50485345;   /* "PHSE" */
+    g_phaseNameTString.len    = 0;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -493,6 +534,49 @@ static int   g_loader_delay_ms = 50;
 static int   g_loader_onkey_cooldown_ms = 250;  /* per-script re-fire lockout */
 static int   g_watchdog_stuck_ms = 8000;         /* 0 disables the watchdog */
 static int   g_ws_enabled        = 1;            /* 0 disables the WebSocket transport (raw-TCP only) */
+
+/* --- Added in v0.5.0. Every one of these defaults to the value that either
+ * preserves pre-0.5.0 behavior or fixes an outright bug, so an existing
+ * install keeps working untouched. See the ini for per-key rationale. --- */
+
+/* Drop OnKey hotkey fires while the game is not the foreground window.
+ * Pre-0.5.0 behavior was to fire regardless of focus, which meant a
+ * browser F5 / F11 would trigger game scripts in the background. Set to 0
+ * to restore that if some workflow depends on it. */
+static int   g_loader_onkey_require_focus = 1;
+
+/* Require the held modifier set to match a binding EXACTLY, so `F5` and
+ * `ctrl+F5` can go to different scripts. 0 = pre-0.5.0 matching, where
+ * modifiers are ignored entirely and a plain `F5` binding fires even while
+ * ctrl is held. */
+static int   g_loader_onkey_exact_modifiers = 1;
+
+/* Re-run OnBoot/OnLoad after a main-menu round-trip. The engine wipes _G
+ * on menu entry and hands out fresh lua_States on the next load, so
+ * without this every OnLoad-installed framework stays dead until the game
+ * process restarts. 0 = pre-0.5.0 behavior (once per process). */
+static int   g_loader_rearm_on_menu = 1;
+
+/* Track the world-load phase ladder so Loader.GetLoadPhase() works and the
+ * menu re-arm can see a load restart. Costs a substring scan per captured
+ * game log line on the detour path; set to 0 to remove that cost entirely
+ * (GetLoadPhase then reports -1 and the menu re-arm stops working). */
+static int   g_loader_track_phase = 1;
+
+/* Source-encoding normalization for .lua files and WS-submitted chunks:
+ * 1 = auto (strip BOMs; transcode valid-UTF-8-with-high-bytes to CP1252),
+ * 0 = off (raw bytes through, pre-0.5.0 behavior; BOMs still stripped
+ * because a BOM is an unconditional Lua 5.1 syntax error). */
+static int   g_loader_source_encoding_auto = 1;
+
+/* One-shot stack-layout dump on the first chunk execution. Exists to
+ * locate this build's pcall status slot; see the STACKDIAG block in
+ * LuaDoString. Cheap (one burst of log lines per process). */
+static int   g_stack_diag     = 1;
+/* Dump the first few executions rather than just one, so a deliberately
+ * failing chunk can be compared against a succeeding one in the same run. */
+#define STACK_DIAG_MAX 8
+static int   g_stackDiagCount = 0;
 
 /* ------------------------------------------------------------------------ *
  * WebSocket client tracking. Multiple concurrent WS clients: each gets
@@ -675,8 +759,12 @@ static void FormatTValue(const char* slot, char* out, size_t out_cap, size_t* ou
  *
  * Must be called from inside a real lua_CFunction detour with a
  * verified-valid L (i.e. after LooksLikeLuaState). */
-static void LuaDoString(void* L, const char* code, size_t code_len,
-                        char* out, size_t out_cap) {
+/* Executor core. `src` is the FixedTString used to hand the source text to
+ * the engine's loadstring; it is a parameter rather than always g_chunkSource
+ * so Loader.LoadFile can execute a nested chunk without overwriting the
+ * source buffer of the chunk that called it. */
+static void LuaDoStringEx(void* L, const char* code, size_t code_len,
+                          char* out, size_t out_cap, FixedTString* src) {
     char *Lc, *new_base, *top_slot;
     void **top_ptr, **base_ptr;
     void *saved_top, *saved_base;
@@ -686,7 +774,20 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
     int result_slots, i;
     int succeeded = 0;
     int have_status = 0;
+    int skip_artifact = 0;
     int first_result;
+    /* STACKDIAG: value of saved_base[0] BEFORE we run anything, so the dump
+     * can prove whether the engine's own frame slot gets written. */
+    int   pre_tt   = 0;
+    void* pre_val  = NULL;
+    int   have_pre = 0;
+    /* Engine-frame preservation — see the big comment before the pcall. */
+    char   frame_save[16 * TVALUE_SIZE];
+    size_t frame_bytes     = 0;
+    int    have_frame_save = 0;
+    int    diag_this_call  = 0;
+    int    status_tt_after = -1;
+    int    status_val_after = 0;
 
     if (!L) { _snprintf_s(out, out_cap, _TRUNCATE, "[bridge] no L"); return; }
     if (!LooksLikeLuaState(L)) {
@@ -698,7 +799,8 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
         return;
     }
     if (code_len == 0)                          { _snprintf_s(out, out_cap, _TRUNCATE, "[bridge] empty chunk"); return; }
-    if (code_len >= sizeof(g_chunkSource.data)) { _snprintf_s(out, out_cap, _TRUNCATE, "[bridge] chunk too large"); return; }
+    if (!src)                              { _snprintf_s(out, out_cap, _TRUNCATE, "[bridge] no chunk source buffer"); return; }
+    if (code_len >= sizeof(src->data))     { _snprintf_s(out, out_cap, _TRUNCATE, "[bridge] chunk too large"); return; }
 
     Lc       = (char*)L;
     top_ptr  = (void**)(Lc + LUA_OFF_TOP);
@@ -712,11 +814,45 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
         return;
     }
 
-    memcpy(g_chunkSource.data, code, code_len);
-    g_chunkSource.data[code_len] = '\0';
-    g_chunkSource.len = (uint32_t)code_len;
+    /* Snapshot the engine's own frame slot 0 before we touch anything. If the
+     * post-run dump shows this changed into a boolean matching the chunk's
+     * success, then this build's luaB_pcall resolved lua_insert(L,1) against
+     * saved_base instead of the new_base we install — meaning every chunk
+     * execution overwrites the first argument of the hooked function we are
+     * standing in, which the detour then calls. That is a correctness bug for
+     * the engine, not just for our result formatting. */
+    if (g_stack_diag && g_stackDiagCount < STACK_DIAG_MAX &&
+        SafeProbe(saved_base, TVALUE_SIZE)) {
+        pre_tt   = *(int*)((char*)saved_base + TVALUE_TT_OFFSET);
+        pre_val  = *(void**)saved_base;
+        have_pre = 1;
+    }
 
-    *(void**)new_base                            = &g_chunkSource;
+    /* --- Engine-frame preservation ---------------------------------------
+     * PROVEN by STACKDIAG over 8 samples on v1.1+bypass: this build's
+     * luaB_pcall writes its boolean status to saved_base[0] — the base of the
+     * frame belonging to the hooked C function we are executing inside —
+     * rather than the new_base we install above. Because each detour calls
+     * the original function AFTER GatedPump, that original then reads a
+     * clobbered argument 1: a `type(x)` routed through luaB_type answers
+     * "boolean" no matter what x is. Every chunk this bridge has ever run
+     * did that to whatever frame it happened to land in.
+     *
+     * Snapshot the frame slots below new_base and restore them once the call
+     * is done. Exact, and costs a couple of TValues each way. The 16-slot cap
+     * is a bound on a value we do not control; measured base_delta is 4. */
+    frame_bytes = (size_t)((char*)new_base - (char*)saved_base);
+    if (frame_bytes > sizeof(frame_save)) frame_bytes = sizeof(frame_save);
+    if (frame_bytes > 0 && SafeProbe(saved_base, frame_bytes)) {
+        memcpy(frame_save, saved_base, frame_bytes);
+        have_frame_save = 1;
+    }
+
+    memcpy(src->data, code, code_len);
+    src->data[code_len] = '\0';
+    src->len = (uint32_t)code_len;
+
+    *(void**)new_base                            = src;
     *(int*)(new_base + TVALUE_TT_OFFSET)         = LUA_TSTRING;
     *base_ptr = new_base;
     *top_ptr  = new_base + TVALUE_SIZE;
@@ -755,6 +891,24 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
     *top_ptr = new_base + TVALUE_SIZE;
 
     pcall_n = SafeCallLuaCFunction(p_luaB_pcall, L);
+
+    /* Read the status from where this build actually leaves it, BEFORE the
+     * frame is put back. Recorded but not yet trusted for the [ok]/[runtime]
+     * label — every sample so far came back `true`, including for a chunk
+     * that failed, so it may be a fixed marker rather than a real status.
+     * Logged next to the formatted result below so the two can be correlated
+     * over a set of known-good and known-bad chunks. */
+    if (have_frame_save && frame_bytes >= TVALUE_SIZE) {
+        status_tt_after  = *(int*)((char*)saved_base + TVALUE_TT_OFFSET);
+        status_val_after = *(int*)saved_base;
+    }
+
+    /* Put the engine's frame back exactly as we found it. Results live at
+     * new_base and above, so this cannot disturb them. */
+    if (have_frame_save) {
+        memcpy(saved_base, frame_save, frame_bytes);
+    }
+
     if (pcall_n < 0) {
         *top_ptr = saved_top; *base_ptr = saved_base;
         _snprintf_s(out, out_cap, _TRUNCATE, "[bridge] luaB_pcall crashed");
@@ -765,18 +919,97 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
     result_slots = (int)(after_exec / TVALUE_SIZE);
     if (result_slots > 16) result_slots = 16;
 
-    /* Detect status: accept either bool (stock) or number (Pandemic's variant). */
-    if (result_slots >= 1) {
-        int tt0 = *(int*)(new_base + TVALUE_TT_OFFSET);
-        if (tt0 == LUA_TBOOLEAN) {
-            have_status = 1;
-            succeeded   = (*(int*)new_base != 0);
-        } else if (tt0 == LUA_TNUMBER) {
-            have_status = 1;
-            succeeded   = (*(const float*)new_base != 0.0f);
+    /* ---- One-shot stack-layout diagnostic (v0.5.0) ----------------------
+     * Live testing on v1.1+bypass showed this build's luaB_pcall leaves a
+     * TABLE in slot 0 with the chunk's real results from slot 1 up — the
+     * boolean status stock luaB_pcall lua_insert()s at index 1 is NOT
+     * anywhere in [new_base, top). Verified across 12 probes: `return` with
+     * 0/1/3 values, and nil/boolean/number/table/function returns, all
+     * landed at slot 1+.
+     *
+     * That leaves one thing worth ruling out: if this build's lua_insert
+     * resolved index 1 against saved_base rather than the new_base we
+     * install above, the status boolean is being written into the engine's
+     * OWN live frame on every execution — which would be stack corruption
+     * and a candidate root cause for the intermittent pump stalls the
+     * watchdog exists to paper over. Dump the window around new_base once
+     * per process so that question can be settled from a log. */
+    if (g_stack_diag && g_stackDiagCount < STACK_DIAG_MAX) {
+        int d;
+        g_stackDiagCount++;
+        diag_this_call = 1;
+        m2_logf("[*] lua_bridge: STACKDIAG #%d new_base=%p saved_base=%p "
+                "saved_top=%p top_now=%p slots=%d (base_delta=%d slots)",
+                g_stackDiagCount, new_base, saved_base, saved_top,
+                *top_ptr, result_slots,
+                (int)(((char*)new_base - (char*)saved_base) / TVALUE_SIZE));
+        /* The decisive line: did the engine's own frame slot 0 change? */
+        if (have_pre) {
+            int  post_tt  = SafeProbe(saved_base, TVALUE_SIZE)
+                            ? *(int*)((char*)saved_base + TVALUE_TT_OFFSET) : -1;
+            void* post_val = SafeProbe(saved_base, TVALUE_SIZE)
+                            ? *(void**)saved_base : NULL;
+            m2_logf("[*] lua_bridge: STACKDIAG   saved_base[0] BEFORE tt=%d val=%p "
+                    "-> AFTER tt=%d val=%p %s",
+                    pre_tt, pre_val, post_tt, post_val,
+                    (pre_tt == post_tt && pre_val == post_val)
+                        ? "(UNCHANGED - engine frame is intact)"
+                        : "(CHANGED - pcall wrote the engine's frame!)");
+        }
+        for (d = -2; d <= 3; ++d) {
+            char* slot = new_base + d * TVALUE_SIZE;
+            if (!SafeProbe(slot, TVALUE_SIZE)) {
+                m2_logf("[*] lua_bridge: STACKDIAG   slot%d unreadable", d);
+                continue;
+            }
+            m2_logf("[*] lua_bridge: STACKDIAG   slot%d tt=%d val=%p",
+                    d, *(int*)(slot + TVALUE_TT_OFFSET), *(void**)slot);
+        }
+        if (SafeProbe(saved_base, TVALUE_SIZE)) {
+            m2_logf("[*] lua_bridge: STACKDIAG   saved_base[0] tt=%d val=%p",
+                    *(int*)((char*)saved_base + TVALUE_TT_OFFSET),
+                    *(void**)saved_base);
         }
     }
-    first_result = have_status ? 1 : 0;
+
+    /* --- Status recovery --------------------------------------------------
+     * VERIFIED LIVE on v1.1+bypass: this build's luaB_pcall leaves its boolean
+     * status at saved_base[0] — captured above, just before the executor
+     * restores the engine's frame. Established by correlation across 8
+     * samples: val=0 for exactly the chunk that failed, val=1 for every chunk
+     * that succeeded.
+     *
+     * This is what finally makes [ok] reachable. Pre-0.5.0 the status was
+     * looked for at new_base[0], which on this build always holds a table, so
+     * `succeeded` was pinned at 0 and every result — successes included — was
+     * labelled [runtime]. */
+    if (status_tt_after == LUA_TBOOLEAN) {
+        have_status = 1;
+        succeeded   = (status_val_after != 0);
+    }
+
+    /* Independently, decide whether slot 0 is a real result or an artifact.
+     * On this build it is always the mystery table. The boolean/number
+     * branches are the stock layout, kept so that adding an RVA table for a
+     * different binary doesn't require rediscovering any of this. */
+    if (result_slots >= 1) {
+        int tt0 = *(int*)(new_base + TVALUE_TT_OFFSET);
+        if (tt0 == LUA_TTABLE || tt0 == LUA_TFUNCTION) {
+            /* Neither can be a pcall status, so it is the slot-0 artifact —
+             * skip it rather than formatting it. That junk "<table>" prefix
+             * was on every result this bridge ever returned. */
+            skip_artifact = 1;
+        } else if (!have_status && tt0 == LUA_TBOOLEAN) {
+            have_status   = 1;
+            succeeded     = (*(int*)new_base != 0);
+            skip_artifact = 1;
+        } else if (!have_status && tt0 == LUA_TNUMBER) {
+            have_status   = 1;
+            succeeded     = (*(const float*)new_base != 0.0f);
+            skip_artifact = 1;
+        }
+    }
+    first_result = skip_artifact ? 1 : 0;
 
     out_len = 0;
     out_len += _snprintf_s(out, out_cap, _TRUNCATE, "%s", succeeded ? "[ok]" : "[runtime]");
@@ -791,6 +1024,22 @@ static void LuaDoString(void* L, const char* code, size_t code_len,
 
     *top_ptr = saved_top;
     *base_ptr = saved_base;
+
+    /* Correlate the recovered status against the actual outcome. If
+     * status_tt_after is consistently LUA_TBOOLEAN and its value tracks
+     * success vs failure across these samples, the [ok]/[runtime] label can
+     * finally be driven from it. */
+    if (diag_this_call) {
+        m2_logf("[*] lua_bridge: STACKDIAG   status_slot_after tt=%d val=%d | result=%s",
+                status_tt_after, status_val_after, out);
+    }
+}
+
+/* Back-compat wrapper — every pre-existing caller runs out of the primary
+ * chunk buffer, unchanged. */
+static void LuaDoString(void* L, const char* code, size_t code_len,
+                        char* out, size_t out_cap) {
+    LuaDoStringEx(L, code, code_len, out, out_cap, &g_chunkSource);
 }
 
 static void RegisterTcpLib(void* L);
@@ -799,6 +1048,8 @@ static void RegisterMathLib(void* L);
 static void RunPolyfill(void* L);
 static void ExecuteLuaFolder(void* L, const char* folder_name);
 static void InitializeKeyScripts(void);
+static void LoaderLogLine(const char* line);
+static void RearmLoaderForNewLoadCycle(const char* why);
 
 /* ------------------------------------------------------------------------ *
  * Pump — drain the input queue against a verified-valid L
@@ -882,7 +1133,11 @@ static __inline void GatedPump(void* L_arg0) {
      * g_lastPumpProgressTick doesn't). */
     g_lastPumpAttemptTick = GetTickCount();
 
-    if (g_loader_enabled && g_loader_onload && g_OnLoadTriggered && !g_OnLoadExecuted) {
+    /* !t_inBridgeExec added in v0.5.0: without it, a script already running
+     * under LuaDoString (an OnBoot chunk, or any queued chunk) could trigger
+     * a detour that lands here and starts OnLoad nested inside it. */
+    if (g_loader_enabled && g_loader_onload && g_OnLoadTriggered &&
+        !g_OnLoadExecuted && !t_inBridgeExec) {
         if (LooksLikeLuaState(L_arg0)) {
             g_OnLoadExecuted = 1;
             ExecuteLuaFolder(L_arg0, "OnLoad");
@@ -899,9 +1154,18 @@ static __inline void GatedPump(void* L_arg0) {
 /* Seen-L set, file-scope so the watchdog can memset it during a hard reset.
  * All access from the game thread's CaptureL; the watchdog only writes
  * (never reads for logic), so no atomicity needed beyond aligned-store. */
-static void* g_seenL[8] = {0};
+#define SEEN_L_SLOTS 16
+static void* g_seenL[SEEN_L_SLOTS] = {0};
+static int   g_seenLNext = 0;   /* ring cursor — where the next eviction writes */
+
+/* Loader once-per-load-cycle guards. File-scope rather than function-local
+ * statics so RearmLoaderForNewLoadCycle() can clear them on a menu return. */
+static volatile LONG g_keyLoaderInitialized = 0;
+static volatile LONG g_onbootExecuted       = 0;
 
 static void CaptureL(void* L, const char* via) {
+    int i;
+
     /* Fast path #1: same L as last capture. This is the common case
      * (every detour fire on the same VM). Single pointer compare. */
     if (!L || L == g_LuaState) return;
@@ -911,19 +1175,31 @@ static void CaptureL(void* L, const char* via) {
      * small pointer array is pure L1 (~5 cycles) versus LooksLikeLuaState
      * which does 4 VirtualQuery syscalls (~2µs). This is the biggest
      * hot-path win — the engine flips between frontend / gameplay VMs
-     * many times per second. */
-    int i;
-    int free_slot = -1;
-    for (i = 0; i < 8; ++i) {
+     * many times per second.
+     *
+     * Scans every slot. The pre-0.5.0 loop broke out at the first NULL,
+     * which was only safe while the table filled strictly front-to-back
+     * and never evicted; with the ring below, entries are no longer
+     * guaranteed contiguous. */
+    for (i = 0; i < SEEN_L_SLOTS; ++i) {
         if (g_seenL[i] == L) { g_LuaState = L; return; }
-        if (g_seenL[i] == NULL) { free_slot = i; break; }
     }
 
     /* Slow path: L we've never seen. Validate, register, log, remember. */
     if (!LooksLikeLuaState(L)) return;
     g_LuaState = L;
-    if (free_slot < 0) return;  /* g_seenL[] full — silently drop the log entry */
-    g_seenL[free_slot] = L;
+
+    /* Ring-evict the oldest entry when the table is full instead of giving
+     * up. A main-menu round-trip burns TWO slots — measured: the engine
+     * builds a fresh shell VM and a fresh game VM per load — so a
+     * fill-and-stop table is exhausted after a handful of menu visits.
+     * Pre-0.5.0, reaching that ceiling returned early and silently killed
+     * two things at once: the fast-path match above (so every subsequent
+     * detour fire on a new VM paid the full 4-syscall validation) and the
+     * lib registration below (so Loader/Tcp/math were missing on fresh VMs
+     * until the next pump batch happened to re-register them). */
+    g_seenL[g_seenLNext] = L;
+    g_seenLNext = (g_seenLNext + 1) % SEEN_L_SLOTS;
 
     m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
     RegisterTcpLib(L);
@@ -931,21 +1207,93 @@ static void CaptureL(void* L, const char* via) {
     RegisterMathLib(L);
     RunPolyfill(L);
 
-    if (g_loader_enabled) {
-        static int key_loader_initialized = 0;
-        if (!key_loader_initialized) {
-            key_loader_initialized = 1;
-            InitializeKeyScripts();
-        }
+    /* New-load-cycle detection, and the reason it lives here rather than in
+     * the log-line detour: verified live, a main-menu round-trip wipes _G and
+     * the next load builds FRESH lua_States. So a brand-new L arriving after a
+     * load cycle has already completed IS the "we started over" signal — and
+     * it is essentially free, because this slow path only runs for VMs we have
+     * never seen. Watching every log line for a marker string cost ~2 FPS.
+     *
+     * Boot is not a false positive: the initial boot's second VM appears
+     * BEFORE OnLoad has executed (confirmed in the logs), so the
+     * g_OnLoadExecuted guard excludes it. Must run before the two blocks
+     * below, since it clears the guards they test. */
+    if (g_loader_enabled && g_loader_rearm_on_menu && g_OnLoadExecuted) {
+        RearmLoaderForNewLoadCycle("fresh Lua VM after a completed load");
     }
 
-    if (g_loader_enabled && g_loader_onboot) {
-        static int onboot_executed = 0;
-        if (!onboot_executed) {
-            onboot_executed = 1;
-            ExecuteLuaFolder(L, "OnBoot");
+    if (g_loader_enabled && !g_keyLoaderInitialized) {
+        g_keyLoaderInitialized = 1;
+        InitializeKeyScripts();
+    }
+
+    if (g_loader_enabled && g_loader_onboot && !g_onbootExecuted) {
+        g_onbootExecuted = 1;
+        ExecuteLuaFolder(L, "OnBoot");
+    }
+}
+
+/* ------------------------------------------------------------------------ *
+ * World-load phase tracking + main-menu re-arm
+ *
+ * Feeds loadprobe's phase ladder (sdk/m2/load_ladder.gen.h) from the log
+ * lines the noop-stub detour already sees.
+ *
+ * Deliberately NOT wired through m2_loadtrigger_install(): that MinHooks
+ * M2_LOG_STUB_VA, which is the SAME address as this mod's own noop_stub
+ * detour (both 0x006D5640 on v1.1+bypass), so installing it would
+ * double-hook a target we already own. We reuse the ladder DATA and
+ * m2_loadtrigger_phase_name() only — neither installs anything.
+ *
+ * Sole consumer is Loader.GetLoadPhase(), which lets a script ask how far the
+ * load has progressed before it touches world entities.
+ *
+ * Scanning is deliberately confined to the duration of a load: the detour
+ * joins + matches only while g_loadPhase is below the fully-loaded phase, and
+ * RearmLoaderForNewLoadCycle drops it back to -1 for the next load. That puts
+ * the cost inside a loading screen, where nobody is counting frames, and
+ * keeps it out of the steady-state frame loop this stub actually lives in.
+ *
+ * The new-load-cycle detection driving the OnBoot/OnLoad re-arm does NOT live
+ * here — it hangs off CaptureL seeing a fresh lua_State, which is free. The
+ * first 0.5.0 cut watched every log line for a load-start marker instead, and
+ * that cost ~2 FPS. See the comment in CaptureL.
+ * ------------------------------------------------------------------------ */
+static volatile LONG g_loadPhase = -1;   /* highest ladder phase this cycle */
+
+/* Highest ladder phase whose marker appears in msg, else -1. Mirrors
+ * m2_loadtrigger's MatchPhase (which is file-static over there). Scans high
+ * to low so the first hit is already the highest and we can return early. */
+static int MatchLoadPhase(const char* msg) {
+    int i, j;
+    for (i = M2_LADDER_COUNT - 1; i >= 0; --i) {
+        const M2LoadPhase* ph = &k_m2_ladder[i];
+        for (j = 0; j < ph->match_count; ++j) {
+            if (strstr(msg, ph->matches[j])) return ph->idx;
         }
     }
+    return -1;
+}
+
+static void RearmLoaderForNewLoadCycle(const char* why) {
+    m2_logf("[*] lua_bridge: new load cycle detected (%s) — re-arming loader "
+            "(was at phase %d)", why, (int)g_loadPhase);
+
+    /* Back to -1 so phase tracking re-activates for the incoming load; the
+     * detour's scan is gated on being below the fully-loaded phase. */
+    g_loadPhase = -1;
+
+    InterlockedExchange(&g_OnLoadTriggered, 0);
+    InterlockedExchange(&g_OnLoadExecuted, 0);
+    if (g_loader_onboot) InterlockedExchange(&g_onbootExecuted, 0);
+
+    /* Re-scan key bindings too — a fresh load cycle is the natural point to
+     * pick up .lua files added since boot. InitializeKeyScripts() is safe to
+     * call repeatedly as of v0.5.0 (it spawns its polling thread once and
+     * swaps the table under a lock). */
+    InterlockedExchange(&g_keyLoaderInitialized, 0);
+
+    g_hotWork = 1;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -953,13 +1301,40 @@ static void CaptureL(void* L, const char* via) {
  * ------------------------------------------------------------------------ */
 static int __cdecl DetourNoopStub(void* L) {
     g_lastDetourFireTick = GetTickCount();
-    if (g_loader_enabled && g_loader_onload && !g_OnLoadTriggered) {
-        char msg[512];
-        if (m2_lua_join_strings(L, msg, sizeof(msg)) >= 1) {
-            if (strstr(msg, "GlobalExit - Complete")) {
-                m2_logf("[*] lua_bridge: OnLoad milestone reached (GlobalExit - Complete). Queuing OnLoad scripts.");
-                InterlockedExchange(&g_OnLoadTriggered, 1);
-                g_hotWork = 1;
+
+    /* HOT PATH — Debug.Printf and ~700 other stripped log functions funnel
+     * through this stub thousands of times per frame from stock scripts, so
+     * anything unconditional here costs real framerate. Both consumers of the
+     * joined log line therefore go dormant on their own:
+     *
+     *   - the OnLoad trigger stops once its milestone is seen (as it always
+     *     did pre-0.5.0)
+     *   - phase tracking stops once the world is fully loaded, and is
+     *     re-armed by RearmLoaderForNewLoadCycle — so it is live during a
+     *     load and idle during gameplay, which is exactly when each is
+     *     wanted.
+     *
+     * Both gates are plain volatile loads. The first 0.5.0 cut ran the join
+     * unconditionally for phase tracking and cost ~2 FPS; measured, not
+     * theorized. Do not make this unconditional again. */
+    {
+        int want_phase  = (g_loader_track_phase &&
+                           g_loadPhase < M2_PHASE_REACHED_WORLD_IDX);
+        int want_onload = (g_loader_enabled && g_loader_onload &&
+                           !g_OnLoadTriggered);
+
+        if (want_phase || want_onload) {
+            char msg[512];
+            if (m2_lua_join_strings(L, msg, sizeof(msg)) >= 1) {
+                if (want_phase) {
+                    int ph = MatchLoadPhase(msg);
+                    if (ph > g_loadPhase) g_loadPhase = ph;
+                }
+                if (want_onload && strstr(msg, "GlobalExit - Complete")) {
+                    m2_logf("[*] lua_bridge: OnLoad milestone reached (GlobalExit - Complete). Queuing OnLoad scripts.");
+                    InterlockedExchange(&g_OnLoadTriggered, 1);
+                    g_hotWork = 1;
+                }
             }
         }
     }
@@ -1129,6 +1504,7 @@ typedef struct {
     char path[MAX_PATH];
     char rel_path[MAX_PATH];
     int load_order;
+    int disabled;      /* set when lua_loader.ini gives off/no/disabled */
 } LuaScriptFile;
 
 static int CompareAlphabetical(const void* a, const void* b) {
@@ -1163,10 +1539,26 @@ static void EnsureLoaderDirectories(void) {
     CreateDirectoryA(path, NULL);
 }
 
-static void CollectScriptsRecursive(const char* base_path, const char* sub_path, LuaScriptFile* list, int* count, int max_count) {
+/* Deepest subdirectory nesting the scanner will descend. Belt-and-braces
+ * behind the reparse-point skip below: unbounded recursion here means a
+ * stack overflow on the game thread, since each level costs ~600 bytes. */
+#define LOADER_MAX_DEPTH 8
+
+/* Number of .lua files the last scan had to drop because the caller's array
+ * was full. Callers reset this before scanning and report it afterwards, so
+ * hitting MAX_SCRIPTS is no longer silent. */
+static int g_scanDropped = 0;
+
+static void CollectScriptsRecursive(const char* base_path, const char* sub_path, LuaScriptFile* list, int* count, int max_count, int depth) {
     char search_path[MAX_PATH];
     WIN32_FIND_DATAA ffd;
     HANDLE hFind;
+
+    if (depth > LOADER_MAX_DEPTH) {
+        m2_logf("[!] lua_bridge: script scan hit the %d-level depth cap at %s%s "
+                "— not descending further", LOADER_MAX_DEPTH, base_path, sub_path);
+        return;
+    }
 
     snprintf(search_path, sizeof(search_path), "%s%s*", base_path, sub_path);
     hFind = FindFirstFileA(search_path, &ffd);
@@ -1174,6 +1566,15 @@ static void CollectScriptsRecursive(const char* base_path, const char* sub_path,
 
     do {
         if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) {
+            continue;
+        }
+
+        /* Never follow junctions or symlinks. A directory junction pointing at
+         * one of its own ancestors is an infinite descent, and the depth cap
+         * alone would still burn a lot of game-thread stack getting there. */
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            m2_logf("[*] lua_bridge: skipping reparse point in script scan: %s%s%s",
+                    base_path, sub_path, ffd.cFileName);
             continue;
         }
 
@@ -1185,20 +1586,29 @@ static void CollectScriptsRecursive(const char* base_path, const char* sub_path,
         }
 
         if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            /* '_'-prefixed directories are never auto-run, so shared library
+             * code can live at e.g. scripts/OnLoad/_lib/ and be pulled in via
+             * Loader.LoadFile instead of executing on its own. Before this,
+             * the recursive scan picked up everything, so there was no way to
+             * keep a non-auto-run .lua anywhere under the folders. */
+            if (ffd.cFileName[0] == '_') continue;
             char next_sub[MAX_PATH];
             snprintf(next_sub, sizeof(next_sub), "%s\\", relative_path);
-            CollectScriptsRecursive(base_path, next_sub, list, count, max_count);
+            CollectScriptsRecursive(base_path, next_sub, list, count, max_count, depth + 1);
         } else {
             size_t len = strlen(ffd.cFileName);
             if (len > 4 && _stricmp(ffd.cFileName + len - 4, ".lua") == 0) {
                 if (*count < max_count) {
                     snprintf(list[*count].path, sizeof(list[*count].path), "%s%s", base_path, relative_path);
-                    
+
                     strncpy(list[*count].rel_path, relative_path, sizeof(list[*count].rel_path) - 1);
                     list[*count].rel_path[sizeof(list[*count].rel_path) - 1] = '\0';
-                    
+
                     list[*count].load_order = -1;
+                    list[*count].disabled   = 0;
                     (*count)++;
+                } else {
+                    g_scanDropped++;
                 }
             }
         }
@@ -1258,6 +1668,14 @@ static void ExtractDefaultKey(const char* file_path, char* out_key, size_t out_m
     fclose(f);
 }
 
+/* Modifier bits for a binding spec. */
+#define KEYMOD_CTRL  0x01
+#define KEYMOD_SHIFT 0x02
+#define KEYMOD_ALT   0x04
+
+/* Resolve a bare key name to a VK. Every mapping that existed pre-0.5.0 is
+ * preserved byte-for-byte; the rest is purely additive, so no existing
+ * lua_loader.ini changes meaning. */
 static int ResolveKeyName(const char* name) {
     if (!name) return 0;
     if (_stricmp(name, "unassigned") == 0) return 0;
@@ -1269,9 +1687,22 @@ static int ResolveKeyName(const char* name) {
         if (c >= '0' && c <= '9') return 0x30 + (c - '0');
     }
 
+    /* Numpad before the F-key test: "numpad1" must not be mistaken for
+     * anything else, and the digit suffix parse is the same shape. */
+    if (_strnicmp(name, "numpad", 6) == 0) {
+        const char* s = name + 6;
+        if (s[0] >= '0' && s[0] <= '9' && s[1] == '\0') return VK_NUMPAD0 + (s[0] - '0');
+        if (_stricmp(s, "plus")     == 0 || _stricmp(s, "add")      == 0) return VK_ADD;
+        if (_stricmp(s, "minus")    == 0 || _stricmp(s, "subtract") == 0) return VK_SUBTRACT;
+        if (_stricmp(s, "multiply") == 0 || _stricmp(s, "star")     == 0) return VK_MULTIPLY;
+        if (_stricmp(s, "divide")   == 0 || _stricmp(s, "slash")    == 0) return VK_DIVIDE;
+        if (_stricmp(s, "decimal")  == 0 || _stricmp(s, "dot")      == 0) return VK_DECIMAL;
+        return 0;
+    }
+
     if ((name[0] == 'f' || name[0] == 'F') && name[1] >= '1' && name[1] <= '9') {
         int num = atoi(name + 1);
-        if (num >= 1 && num <= 12) return 0x70 + (num - 1);
+        if (num >= 1 && num <= 24) return 0x70 + (num - 1);
     }
 
     if (_stricmp(name, "insert") == 0) return VK_INSERT;
@@ -1293,7 +1724,261 @@ static int ResolveKeyName(const char* name) {
     if (_stricmp(name, "right") == 0) return VK_RIGHT;
     if (_stricmp(name, "down") == 0) return VK_DOWN;
 
+    /* --- added in v0.5.0 --- */
+    /* Left/right-specific modifiers, for when "either shift" is too broad. */
+    if (_stricmp(name, "lshift") == 0) return VK_LSHIFT;
+    if (_stricmp(name, "rshift") == 0) return VK_RSHIFT;
+    if (_stricmp(name, "lctrl")  == 0) return VK_LCONTROL;
+    if (_stricmp(name, "rctrl")  == 0) return VK_RCONTROL;
+    if (_stricmp(name, "lalt")   == 0) return VK_LMENU;
+    if (_stricmp(name, "ralt")   == 0) return VK_RMENU;
+
+    /* Lock / system keys. */
+    if (_stricmp(name, "capslock")    == 0) return VK_CAPITAL;
+    if (_stricmp(name, "numlock")     == 0) return VK_NUMLOCK;
+    if (_stricmp(name, "scrolllock")  == 0) return VK_SCROLL;
+    if (_stricmp(name, "pause")       == 0 || _stricmp(name, "break") == 0) return VK_PAUSE;
+    if (_stricmp(name, "printscreen") == 0 || _stricmp(name, "prtsc") == 0) return VK_SNAPSHOT;
+
+    /* Punctuation / OEM. "tilde" is the traditional console key and was
+     * previously unbindable, which pushed people onto F-keys the browser
+     * also claims. */
+    if (_stricmp(name, "tilde") == 0 || _stricmp(name, "grave") == 0 ||
+        _stricmp(name, "`")     == 0) return VK_OEM_3;
+    if (_stricmp(name, "minus")     == 0 || _stricmp(name, "-") == 0) return VK_OEM_MINUS;
+    if (_stricmp(name, "plus")      == 0 || _stricmp(name, "=") == 0 ||
+        _stricmp(name, "equals")    == 0) return VK_OEM_PLUS;
+    if (_stricmp(name, "lbracket")  == 0 || _stricmp(name, "[") == 0) return VK_OEM_4;
+    if (_stricmp(name, "rbracket")  == 0 || _stricmp(name, "]") == 0) return VK_OEM_6;
+    if (_stricmp(name, "backslash") == 0 || _stricmp(name, "\\") == 0) return VK_OEM_5;
+    if (_stricmp(name, "semicolon") == 0 || _stricmp(name, ";") == 0) return VK_OEM_1;
+    if (_stricmp(name, "quote")     == 0 || _stricmp(name, "'") == 0) return VK_OEM_7;
+    if (_stricmp(name, "comma")     == 0 || _stricmp(name, ",") == 0) return VK_OEM_COMMA;
+    if (_stricmp(name, "period")    == 0 || _stricmp(name, ".") == 0) return VK_OEM_PERIOD;
+    if (_stricmp(name, "slash")     == 0 || _stricmp(name, "/") == 0) return VK_OEM_2;
+
+    /* Extra mouse buttons — thumb buttons make good mod keys since the game
+     * doesn't bind them. Note these are NOT focus-gated any differently
+     * from keys; the same IsGameFocused() check applies. */
+    if (_stricmp(name, "mouse4") == 0) return VK_XBUTTON1;
+    if (_stricmp(name, "mouse5") == 0) return VK_XBUTTON2;
+
     return 0;
+}
+
+/* Parse a full binding spec: "F5", "ctrl+F5", "shift+alt+k", "numpad3".
+ * Modifier prefixes are order-independent and case-insensitive. Returns the
+ * base VK (0 if unrecognized) and writes the modifier mask to *out_mods.
+ *
+ * A bare modifier name still resolves as a base key ("shift" -> VK_SHIFT),
+ * preserving pre-0.5.0 behavior for anyone who bound one directly. */
+static int ResolveKeySpec(const char* spec, int* out_mods) {
+    char   buf[64];
+    char   tok[64];
+    char*  p;
+    char*  plus;
+    size_t n;
+    int    mods = 0;
+
+    if (out_mods) *out_mods = 0;
+    if (!spec) return 0;
+
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    p = buf;
+    while (*p == ' ' || *p == '\t') ++p;
+    n = strlen(p);
+    while (n > 0 && (p[n - 1] == ' '  || p[n - 1] == '\t' ||
+                     p[n - 1] == '\r' || p[n - 1] == '\n')) {
+        p[--n] = '\0';
+    }
+
+    for (;;) {
+        plus = strchr(p, '+');
+        if (!plus) break;
+        n = (size_t)(plus - p);
+        if (n == 0 || n >= sizeof(tok)) break;   /* e.g. the "+" key itself */
+        memcpy(tok, p, n);
+        tok[n] = '\0';
+        if      (_stricmp(tok, "ctrl")  == 0 || _stricmp(tok, "control") == 0) mods |= KEYMOD_CTRL;
+        else if (_stricmp(tok, "shift") == 0) mods |= KEYMOD_SHIFT;
+        else if (_stricmp(tok, "alt")   == 0) mods |= KEYMOD_ALT;
+        else break;                              /* not a modifier token */
+        p = plus + 1;
+        while (*p == ' ') ++p;
+    }
+
+    if (out_mods) *out_mods = mods;
+    return ResolveKeyName(p);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Script byte loading + source-encoding normalization
+ *
+ * ONE chokepoint for turning a .lua file on disk into bytes for the
+ * executor, replacing the two near-identical fopen/fseek/malloc/fread
+ * blocks that used to live in ExecuteLuaFolder and LoaderKeyThread.
+ *
+ * Why normalize: the engine's text renderers consume strings as single-byte
+ * CP1252 — verified live against BOTH the native MrxGui.TextWidget font path
+ * and the Scaleform .gfx path. A .lua saved as UTF-8 puts two bytes (C3 B6)
+ * where the renderer wants one (F6), so "Möbius" renders as "MÃ¶bius". The
+ * bridge is byte-transparent and always was; the mismatch is purely
+ * authoring encoding vs what the renderer expects, so this is the right
+ * layer to fix it.
+ *
+ * Two transformations, in order:
+ *
+ *   1. BOM strip — unconditional, even with normalization off. A UTF-8 BOM
+ *      is a hard Lua 5.1 syntax error ("unexpected symbol"), and editors add
+ *      one silently, so nothing can depend on it surviving. UTF-16 BOMs get
+ *      an explicit log line instead of being fed to the parser as garbage.
+ *
+ *   2. UTF-8 -> CP1252 — only when the bytes are VALID UTF-8 (probed with
+ *      MB_ERR_INVALID_CHARS) *and* contain a byte >= 0x80. Pure ASCII is
+ *      bit-identical in both encodings so it is never touched, and an
+ *      already-CP1252 file with high bytes almost never forms valid UTF-8,
+ *      so it fails the probe and passes through untouched. That makes the
+ *      auto-detect safe in both directions rather than a guess.
+ *
+ * Characters with no CP1252 representation (CJK, Cyrillic, checkmarks)
+ * cannot survive the trip; those are logged per file so the author finds
+ * out rather than silently shipping '?' glyphs.
+ *
+ * Known corner: a CP1252 file containing literal mojibake ("Ã©" = C3 A9) is
+ * itself valid UTF-8 and will be folded to "é". That is almost certainly
+ * repairing an earlier double-encode, and is vanishingly rare in real Lua
+ * source. Set loader_source_encoding = 0 to opt out entirely.
+ * ------------------------------------------------------------------------ */
+static void NormalizeSourceEncoding(char** pbuf, size_t* plen,
+                                    const char* what, const char* path) {
+    char*  buf = *pbuf;
+    size_t len = *plen;
+    size_t i;
+    int    has_high = 0;
+    int    wlen, clen;
+    wchar_t* wide;
+    char*  conv;
+    BOOL   used_default = FALSE;
+
+    /* --- 1. BOM handling (runs even when normalization is switched off) --- */
+    if (len >= 3 && (unsigned char)buf[0] == 0xEF &&
+                    (unsigned char)buf[1] == 0xBB &&
+                    (unsigned char)buf[2] == 0xBF) {
+        memmove(buf, buf + 3, len - 3 + 1);
+        len -= 3;
+        m2_logf("[*] lua_bridge: %s: stripped UTF-8 BOM from %s "
+                "(a BOM is a Lua 5.1 syntax error)", what, path);
+    } else if (len >= 2 &&
+               (((unsigned char)buf[0] == 0xFF && (unsigned char)buf[1] == 0xFE) ||
+                ((unsigned char)buf[0] == 0xFE && (unsigned char)buf[1] == 0xFF))) {
+        m2_logf("[!] lua_bridge: %s: %s looks UTF-16 encoded (BOM %02X %02X). "
+                "Lua cannot parse that — re-save it as ANSI or UTF-8.",
+                what, path, (unsigned char)buf[0], (unsigned char)buf[1]);
+        *plen = len;
+        return;
+    }
+    *plen = len;
+
+    if (!g_loader_source_encoding_auto || len == 0) return;
+
+    for (i = 0; i < len; ++i) {
+        if ((unsigned char)buf[i] >= 0x80) { has_high = 1; break; }
+    }
+    if (!has_high) return;   /* pure ASCII — identical in both encodings */
+
+    /* MB_ERR_INVALID_CHARS makes this fail on CP1252 input, which is exactly
+     * the discriminator we want: success => it really is UTF-8. */
+    wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf, (int)len, NULL, 0);
+    if (wlen <= 0) return;   /* not valid UTF-8 — assume CP1252 already */
+
+    wide = (wchar_t*)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wide) return;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf, (int)len,
+                            wide, wlen) != wlen) {
+        free(wide);
+        return;
+    }
+
+    clen = WideCharToMultiByte(1252, 0, wide, wlen, NULL, 0, NULL, NULL);
+    if (clen <= 0) { free(wide); return; }
+    conv = (char*)malloc((size_t)clen + 1);
+    if (!conv) { free(wide); return; }
+    if (WideCharToMultiByte(1252, 0, wide, wlen, conv, clen,
+                            "?", &used_default) != clen) {
+        free(conv);
+        free(wide);
+        return;
+    }
+    conv[clen] = '\0';
+    free(wide);
+
+    /* Count the substitutions rather than just reporting that some happened —
+     * "13 characters became '?'" is actionable, "some characters" is not.
+     * Two linear scans on an already-linear operation; negligible. */
+    if (used_default) {
+        size_t qi, before_q = 0, after_q = 0;
+        for (qi = 0; qi < len; ++qi)            if (buf[qi]  == '?') before_q++;
+        for (qi = 0; qi < (size_t)clen; ++qi)   if (conv[qi] == '?') after_q++;
+        m2_logf("[*] lua_bridge: %s: %s was UTF-8 — transcoded to CP1252 "
+                "(%lu -> %lu bytes). %lu character(s) have no CP1252 equivalent "
+                "and became '?'. Harmless if they are in comments; check any "
+                "that are in displayed strings (the engine cannot render them "
+                "either way).",
+                what, path, (unsigned long)len, (unsigned long)clen,
+                (unsigned long)(after_q > before_q ? after_q - before_q : 0));
+    } else {
+        m2_logf("[*] lua_bridge: %s: %s was UTF-8 — transcoded to CP1252 "
+                "(%lu -> %lu bytes)", what, path,
+                (unsigned long)len, (unsigned long)clen);
+    }
+
+    free(*pbuf);
+    *pbuf = conv;
+    *plen = (size_t)clen;
+}
+
+/* Read a .lua into a fresh NUL-terminated buffer, encoding-normalized.
+ * Returns NULL on any failure (already logged). Caller frees. */
+static char* LoadScriptBytes(const char* path, const char* what, size_t* out_len) {
+    FILE*  f;
+    long   sz;
+    char*  buf;
+    size_t n;
+
+    *out_len = 0;
+    f = fopen(path, "rb");
+    if (!f) {
+        m2_logf("[!] lua_bridge: %s: failed to open %s", what, path);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    /* Cap against the executor's own limit rather than a separate constant,
+     * so "the loader accepted it" and "the executor will run it" can't
+     * disagree. Oversize is now logged instead of silently skipped. */
+    if (sz <= 0 || sz >= (long)sizeof(g_chunkSource.data)) {
+        if (sz > 0) {
+            m2_logf("[!] lua_bridge: %s: %s is %ld bytes, at/over the %lu-byte "
+                    "chunk cap — skipped", what, path, sz,
+                    (unsigned long)sizeof(g_chunkSource.data));
+        }
+        fclose(f);
+        return NULL;
+    }
+
+    buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    NormalizeSourceEncoding(&buf, &n, what, path);
+    *out_len = n;
+    return buf;
 }
 
 static void ExecuteLuaFolder(void* L, const char* folder_name) {
@@ -1301,9 +1986,30 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
     char folder_path[MAX_PATH];
     char loader_ini_path[MAX_PATH];
     char* slash;
-    LuaScriptFile scripts[MAX_SCRIPTS];
+    /* static rather than stack: 128 * sizeof(LuaScriptFile) is ~67 KB and
+     * this runs on the game thread inside a detour frame, where the
+     * remaining stack budget is not ours to assume. result_buf is also
+     * bumped to PumpQueue's 16 KB — at 4 KB it silently truncated the
+     * results and error messages of any script that returned much. Safe as
+     * statics because of the nesting guard directly below. */
+    static LuaScriptFile scripts[MAX_SCRIPTS];
+    static char result_buf[16384];
+    static int  in_folder = 0;
     int script_count = 0;
     int i;
+
+    /* Re-entrancy guard. A script run from here can trigger a detour, and
+     * GatedPump's OnLoad branch does not consult t_inBridgeExec — so OnLoad
+     * could begin while OnBoot was still on the stack. That was always
+     * fragile; with static buffers it would be outright corruption, so
+     * refuse to nest. (GatedPump now also checks t_inBridgeExec, making this
+     * belt-and-braces rather than the only defense.) */
+    if (in_folder) {
+        m2_logf("[!] lua_bridge: ExecuteLuaFolder(%s) re-entered while another "
+                "folder was still running — skipped", folder_name);
+        return;
+    }
+    in_folder = 1;
 
     GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
     slash = strrchr(exe_dir, '\\');
@@ -1313,17 +2019,43 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
     m2_module_path(g_hModule, "lua_loader.ini", loader_ini_path, sizeof(loader_ini_path));
     EnsureLoaderIniHeader(loader_ini_path);
 
-    CollectScriptsRecursive(folder_path, "", scripts, &script_count, MAX_SCRIPTS);
+    g_scanDropped = 0;
+    CollectScriptsRecursive(folder_path, "", scripts, &script_count, MAX_SCRIPTS, 0);
+    if (g_scanDropped > 0) {
+        m2_logf("[!] lua_bridge: scripts/%s/ holds more than %d .lua files — %d were "
+                "silently ignored. Raise MAX_SCRIPTS or split the folder.",
+                folder_name, MAX_SCRIPTS, g_scanDropped);
+    }
 
     if (script_count == 0) {
         m2_logf("[*] lua_bridge: No scripts found in scripts/%s/", folder_name);
+        in_folder = 0;
         return;
     }
 
     qsort(scripts, script_count, sizeof(LuaScriptFile), CompareAlphabetical);
 
     for (i = 0; i < script_count; ++i) {
-        int order = GetPrivateProfileIntA(folder_name, scripts[i].rel_path, -1, loader_ini_path);
+        char order_val[64];
+        int  order;
+
+        /* Read as a string first so an explicit disable sentinel can be told
+         * apart from a number. Deliberately NOT repurposing "0" for disable:
+         * an existing ini could legitimately contain 0 and it currently runs
+         * the script, so changing that meaning would break installs. */
+        GetPrivateProfileStringA(folder_name, scripts[i].rel_path, "",
+                                 order_val, sizeof(order_val), loader_ini_path);
+        if (order_val[0] != '\0' &&
+            (_stricmp(order_val, "off")      == 0 ||
+             _stricmp(order_val, "no")       == 0 ||
+             _stricmp(order_val, "disabled") == 0)) {
+            m2_logf("[*] lua_bridge: %s script disabled by ini: %s",
+                    folder_name, scripts[i].rel_path);
+            scripts[i].disabled = 1;
+            continue;
+        }
+
+        order = GetPrivateProfileIntA(folder_name, scripts[i].rel_path, -1, loader_ini_path);
         if (order == -1) {
             order = (i + 1) * 10;
             char order_str[32];
@@ -1343,39 +2075,52 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
     RunPolyfill(L);
 
     for (i = 0; i < script_count; ++i) {
-        FILE* f = fopen(scripts[i].path, "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            long sz = ftell(f);
-            fseek(f, 0, SEEK_SET);
+        size_t code_len = 0;
+        char*  code;
 
-            if (sz > 0 && sz < 1024 * 1024) { // Max 1MB
-                char* buf = (char*)malloc(sz + 1);
-                if (buf) {
-                    size_t read_bytes = fread(buf, 1, sz, f);
-                    buf[read_bytes] = '\0';
+        if (scripts[i].disabled) continue;
 
-                    m2_logf("[*] lua_bridge: Loading script (%s): %s (%ld bytes)", folder_name, scripts[i].rel_path, sz);
-                    
-                    char result_buf[4096];
-                    t_inBridgeExec = TRUE;
-                    LuaDoString(L, buf, read_bytes, result_buf, sizeof(result_buf));
-                    t_inBridgeExec = FALSE;
-                    
-                    m2_logf("[+] lua_bridge: Script result: %s", result_buf);
+        code = LoadScriptBytes(scripts[i].path, folder_name, &code_len);
+        if (!code) continue;   /* already logged with a reason */
 
-                    free(buf);
-                }
-            }
-            fclose(f);
-        } else {
-            m2_logf("[!] lua_bridge: Failed to open script: %s", scripts[i].path);
+        m2_logf("[*] lua_bridge: Loading script (%s): %s (%lu bytes)",
+                folder_name, scripts[i].rel_path, (unsigned long)code_len);
+
+        /* Watchdog telemetry. Pre-0.5.0 this set t_inBridgeExec but NOT
+         * g_bridgeExecStartTick, so the watchdog's hung-inside-exec path
+         * (the whole point of v0.3.1) was blind to a hang in an OnBoot or
+         * OnLoad script — precisely the case it was written to catch, since
+         * a blocked game thread also stops the detours Path B relies on. */
+        g_bridgeExecStartTick = GetTickCount();
+        t_inBridgeExec = TRUE;
+        LuaDoString(L, code, code_len, result_buf, sizeof(result_buf));
+        t_inBridgeExec = FALSE;
+        g_bridgeExecStartTick = 0;
+
+        m2_logf("[+] lua_bridge: Script result: %s", result_buf);
+
+        /* Mirror to the live channels. Pre-0.5.0 loader results went to the
+         * .log only, so a connected REPL or browser client never saw an
+         * OnBoot/OnLoad failure — you had to know to go read the file. */
+        {
+            char line[1024];
+            _snprintf_s(line, sizeof(line), _TRUNCATE, "[%s] %s -> %s",
+                        folder_name, scripts[i].rel_path, result_buf);
+            LoaderLogLine(line);
         }
 
-        if (g_loader_delay_ms > 0 && i < script_count - 1) {
-            Sleep(g_loader_delay_ms);
-        }
+        free(code);
+
+        /* NOTE: loader_delay_ms deliberately no longer sleeps here.
+         * ExecuteLuaFolder runs ON the game thread (via CaptureL for OnBoot
+         * and GatedPump for OnLoad), so Sleep()ing between scripts could
+         * never "let the engine settle" the way the option's name suggests —
+         * the engine IS the thread being slept. All it bought was a
+         * loader_delay_ms * (scripts-1) freeze on top of the load. The key
+         * is still parsed so existing inis stay valid; see the ini comment. */
     }
+
+    in_folder = 0;
 }
 
 typedef struct {
@@ -1383,6 +2128,7 @@ typedef struct {
     char  rel_path[MAX_PATH];
     char  key_name[64];
     int   vk_code;
+    int   mods;              /* KEYMOD_* mask required alongside vk_code */
     int   was_down;
     DWORD last_fired_tick;   /* GetTickCount() at last successful queue-push */
     int   throttle_logged;   /* First cooldown throttle for this script logged? */
@@ -1390,6 +2136,14 @@ typedef struct {
 
 static LuaKeyScript g_KeyScripts[MAX_SCRIPTS];
 static int g_KeyScriptCount = 0;
+
+/* Guards g_KeyScripts / g_KeyScriptCount. The polling thread reads the table
+ * while InitializeKeyScripts may be rebuilding it — pre-0.5.0 that was only
+ * safe because the scan ran exactly once, before the thread was spawned.
+ * Now that a load-cycle re-arm can rescan, the table needs a lock. */
+static CRITICAL_SECTION g_keyScriptMtx;
+static int              g_keyScriptMtxInit = 0;
+static int              g_keyThreadStarted = 0;
 
 /* ------------------------------------------------------------------------ *
  * Key-event ring buffer — feeds Loader.PopKeyEvents().
@@ -1471,7 +2225,13 @@ static DWORD WINAPI WatchdogThread(LPVOID param) {
 
         int stuck_ms = g_watchdog_stuck_ms;
         if (stuck_ms <= 0) continue;            /* watchdog disabled by ini */
-        if (g_PendingScripts <= 0) continue;    /* nothing to be stuck about */
+
+        /* v0.5.0: no early-out on g_PendingScripts here any more. Path A
+         * (hung inside exec) has to be able to fire for OnBoot/OnLoad
+         * scripts, which run straight through ExecuteLuaFolder and never
+         * enter the queue — so PendingScripts is 0 during exactly the hang
+         * we most want to catch. Path B keeps the guard, since a queue stall
+         * is meaningless with nothing queued. */
 
         DWORD now             = GetTickCount();
         DWORD since_detour    = now - g_lastDetourFireTick;
@@ -1502,6 +2262,7 @@ static DWORD WINAPI WatchdogThread(LPVOID param) {
          * pump entering but not draining. Requires detours to have fired
          * recently to distinguish real stalls from legitimate pauses. */
         if (!fired) {
+            if (g_PendingScripts <= 0) continue;  /* nothing queued to stall on */
             if (since_detour > 2000) continue;
             if (since_progress < (DWORD)stuck_ms) continue;
             if (last_reset_tick != 0 && since_last_reset < (DWORD)(stuck_ms / 2)) continue;
@@ -1564,14 +2325,53 @@ static DWORD WINAPI LoaderKeyEventThread(LPVOID param) {
     return 0;
 }
 
+/* Do the currently-held modifiers exactly match `mods`?
+ *
+ * Exact match (not "at least"), so `F5` and `ctrl+F5` can be bound to
+ * different scripts without both firing. The one behavior difference for
+ * pre-0.5.0 bindings: a plain `F5` binding no longer fires while ctrl/shift/
+ * alt is held. That is almost never intended, and
+ * loader_onkey_exact_modifiers = 0 restores the old "ignore modifiers"
+ * matching for anyone who relied on it. */
+static BOOL ModifiersMatch(int mods) {
+    int held = 0;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) held |= KEYMOD_CTRL;
+    if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) held |= KEYMOD_SHIFT;
+    if (GetAsyncKeyState(VK_MENU)    & 0x8000) held |= KEYMOD_ALT;
+    if (!g_loader_onkey_exact_modifiers) return (held & mods) == mods;
+    return held == mods;
+}
+
 static DWORD WINAPI LoaderKeyThread(LPVOID param) {
     (void)param;
     for (;;) {
         int i;
+
+        /* Focus gate. LoaderKeyEventThread (which feeds Loader.PopKeyEvents)
+         * has always dropped keystrokes while the game is in the background;
+         * this thread did not, so a browser F5/F11 or anything typed into
+         * another app fired game scripts behind your back. Same predicate,
+         * same reasoning — just applied to the path that runs whole .lua
+         * files. Sampled once per tick rather than per script. */
+        if (g_loader_onkey_require_focus && !IsGameFocused()) {
+            /* Clear edge state so refocusing with a key already held does
+             * not immediately fire on a stale up->down transition. */
+            for (i = 0; i < g_KeyScriptCount; ++i) g_KeyScripts[i].was_down = 0;
+            Sleep(33);
+            continue;
+        }
+
+        if (g_keyScriptMtxInit) EnterCriticalSection(&g_keyScriptMtx);
         for (i = 0; i < g_KeyScriptCount; ++i) {
             int vk = g_KeyScripts[i].vk_code;
             if (vk > 0 && vk < 256) {
                 int is_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                if (is_down && !ModifiersMatch(g_KeyScripts[i].mods)) {
+                    /* Right key, wrong modifier set. Treat as not-pressed so
+                     * releasing the modifier and pressing again re-triggers. */
+                    g_KeyScripts[i].was_down = 0;
+                    continue;
+                }
                 if (is_down) {
                     if (!g_KeyScripts[i].was_down) {
                         g_KeyScripts[i].was_down = 1;
@@ -1620,27 +2420,21 @@ static DWORD WINAPI LoaderKeyThread(LPVOID param) {
 
                         g_KeyScripts[i].last_fired_tick = GetTickCount();
 
-                        // Load script file and queue it
-                        FILE* f = fopen(g_KeyScripts[i].path, "rb");
-                        if (f) {
-                            fseek(f, 0, SEEK_END);
-                            long sz = ftell(f);
-                            fseek(f, 0, SEEK_SET);
-                            
-                            if (sz > 0 && sz < 1024 * 1024) {
-                                char* buf = (char*)malloc(sz + 1);
-                                if (buf) {
-                                    size_t read_bytes = fread(buf, 1, sz, f);
-                                    buf[read_bytes] = '\0';
-                                    
-                                    m2_logf("[*] lua_bridge: OnKey hotkey '%s' pressed. Queuing script %s",
-                                            g_KeyScripts[i].key_name, g_KeyScripts[i].rel_path);
-                                    InQueuePush(buf, read_bytes, 0);
-                                    
-                                    free(buf);
-                                }
+                        /* Read + queue. Goes through the shared chokepoint so
+                         * an OnKey script gets the same BOM strip and
+                         * UTF-8->CP1252 normalization as OnBoot/OnLoad. Still
+                         * re-read from disk on every press, which is what
+                         * makes editing a bound script hot-reload. */
+                        {
+                            size_t code_len = 0;
+                            char*  code = LoadScriptBytes(g_KeyScripts[i].path,
+                                                          "OnKey", &code_len);
+                            if (code) {
+                                m2_logf("[*] lua_bridge: OnKey hotkey '%s' pressed. Queuing script %s",
+                                        g_KeyScripts[i].key_name, g_KeyScripts[i].rel_path);
+                                InQueuePush(code, code_len, 0);
+                                free(code);
                             }
-                            fclose(f);
                         }
                     }
                 } else {
@@ -1648,18 +2442,35 @@ static DWORD WINAPI LoaderKeyThread(LPVOID param) {
                 }
             }
         }
+        if (g_keyScriptMtxInit) LeaveCriticalSection(&g_keyScriptMtx);
         Sleep(33); // 30Hz polling rate
     }
     return 0;
 }
 
+/* Scan scripts/OnKey/, resolve bindings, and swap the table in.
+ *
+ * Safe to call repeatedly as of v0.5.0 (the load-cycle re-arm does exactly
+ * that, so a .lua added mid-session gets picked up without a restart):
+ *   - builds into a scratch table and swaps under g_keyScriptMtx, so the
+ *     polling thread never sees a half-built table;
+ *   - spawns the polling thread only once, however many times it is called.
+ *     Pre-0.5.0 the CreateThread was unconditional, so a second call would
+ *     have left two pollers running and fired every hotkey twice. */
 static void InitializeKeyScripts(void) {
     char exe_dir[MAX_PATH];
     char folder_path[MAX_PATH];
     char loader_ini_path[MAX_PATH];
     char* slash;
-    int i;
-    
+    int i, j;
+    /* static: ~67 KB + ~78 KB is far too much stack for a detour frame.
+     * Serialized by construction — only ever called from CaptureL on the
+     * game thread. */
+    static LuaScriptFile temp_files[MAX_SCRIPTS];
+    static LuaKeyScript  rebuilt[MAX_SCRIPTS];
+    int file_count = 0;
+    int built = 0;
+
     GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
     slash = strrchr(exe_dir, '\\');
     if (slash) *(slash + 1) = '\0';
@@ -1668,49 +2479,113 @@ static void InitializeKeyScripts(void) {
     m2_module_path(g_hModule, "lua_loader.ini", loader_ini_path, sizeof(loader_ini_path));
     EnsureLoaderIniHeader(loader_ini_path);
 
-    LuaScriptFile temp_files[MAX_SCRIPTS];
-    int file_count = 0;
-    CollectScriptsRecursive(folder_path, "", temp_files, &file_count, MAX_SCRIPTS);
-
-    g_KeyScriptCount = 0;
+    g_scanDropped = 0;
+    CollectScriptsRecursive(folder_path, "", temp_files, &file_count, MAX_SCRIPTS, 0);
+    if (g_scanDropped > 0) {
+        m2_logf("[!] lua_bridge: scripts/OnKey/ holds more than %d .lua files — %d "
+                "were silently ignored.", MAX_SCRIPTS, g_scanDropped);
+    }
 
     if (file_count == 0) {
         m2_logf("[*] lua_bridge: No scripts found in scripts/OnKey/");
+        if (g_keyScriptMtxInit) EnterCriticalSection(&g_keyScriptMtx);
+        g_KeyScriptCount = 0;
+        if (g_keyScriptMtxInit) LeaveCriticalSection(&g_keyScriptMtx);
         return;
     }
 
     qsort(temp_files, file_count, sizeof(LuaScriptFile), CompareAlphabetical);
 
-    for (i = 0; i < file_count && g_KeyScriptCount < MAX_SCRIPTS; ++i) {
+    for (i = 0; i < file_count && built < MAX_SCRIPTS; ++i) {
         char key_name[64];
-        
-        GetPrivateProfileStringA("OnKey", temp_files[i].rel_path, "", key_name, sizeof(key_name), loader_ini_path);
-        
+        int  mods = 0;
+        int  vk;
+
+        GetPrivateProfileStringA("OnKey", temp_files[i].rel_path, "", key_name,
+                                 sizeof(key_name), loader_ini_path);
+
         if (key_name[0] == '\0') {
             ExtractDefaultKey(temp_files[i].path, key_name, sizeof(key_name));
-            WritePrivateProfileStringA("OnKey", temp_files[i].rel_path, key_name, loader_ini_path);
+            WritePrivateProfileStringA("OnKey", temp_files[i].rel_path, key_name,
+                                       loader_ini_path);
         }
 
-        strncpy(g_KeyScripts[g_KeyScriptCount].path, temp_files[i].path, sizeof(g_KeyScripts[g_KeyScriptCount].path) - 1);
-        g_KeyScripts[g_KeyScriptCount].path[sizeof(g_KeyScripts[g_KeyScriptCount].path) - 1] = '\0';
+        if (_stricmp(key_name, "off")      == 0 ||
+            _stricmp(key_name, "no")       == 0 ||
+            _stricmp(key_name, "disabled") == 0) {
+            m2_logf("[*] lua_bridge: OnKey script disabled by ini: %s",
+                    temp_files[i].rel_path);
+            continue;
+        }
 
-        strncpy(g_KeyScripts[g_KeyScriptCount].rel_path, temp_files[i].rel_path, sizeof(g_KeyScripts[g_KeyScriptCount].rel_path) - 1);
-        g_KeyScripts[g_KeyScriptCount].rel_path[sizeof(g_KeyScripts[g_KeyScriptCount].rel_path) - 1] = '\0';
+        vk = ResolveKeySpec(key_name, &mods);
 
-        strncpy(g_KeyScripts[g_KeyScriptCount].key_name, key_name, sizeof(g_KeyScripts[g_KeyScriptCount].key_name) - 1);
-        g_KeyScripts[g_KeyScriptCount].key_name[sizeof(g_KeyScripts[g_KeyScriptCount].key_name) - 1] = '\0';
+        /* Unrecognized names used to resolve silently to VK 0 and simply
+         * never fire, which is a miserable thing to debug — a typo like
+         * "pgup" or "F13" looked identical to a working binding in the log. */
+        if (vk == 0 && _stricmp(key_name, "unassigned") != 0) {
+            m2_logf("[!] lua_bridge: OnKey '%s' for %s is not a recognized key name "
+                    "— this script will NEVER fire. Try a letter/digit, F1..F24, "
+                    "numpad0..9, insert/delete/home/end/pageup/pagedown, tilde, "
+                    "or a ctrl+/shift+/alt+ combination.",
+                    key_name, temp_files[i].rel_path);
+        }
 
-        g_KeyScripts[g_KeyScriptCount].vk_code = ResolveKeyName(key_name);
-        g_KeyScripts[g_KeyScriptCount].was_down = 0;
+        strncpy(rebuilt[built].path, temp_files[i].path, sizeof(rebuilt[built].path) - 1);
+        rebuilt[built].path[sizeof(rebuilt[built].path) - 1] = '\0';
 
-        m2_logf("[*] lua_bridge: Registered OnKey script: scripts/OnKey/%s bound to '%s' (VK 0x%X)", 
-                temp_files[i].rel_path, key_name, g_KeyScripts[g_KeyScriptCount].vk_code);
+        strncpy(rebuilt[built].rel_path, temp_files[i].rel_path, sizeof(rebuilt[built].rel_path) - 1);
+        rebuilt[built].rel_path[sizeof(rebuilt[built].rel_path) - 1] = '\0';
 
-        g_KeyScriptCount++;
+        strncpy(rebuilt[built].key_name, key_name, sizeof(rebuilt[built].key_name) - 1);
+        rebuilt[built].key_name[sizeof(rebuilt[built].key_name) - 1] = '\0';
+
+        rebuilt[built].vk_code         = vk;
+        rebuilt[built].mods            = mods;
+        rebuilt[built].was_down        = 0;
+        rebuilt[built].last_fired_tick = 0;
+        rebuilt[built].throttle_logged = 0;
+
+        m2_logf("[*] lua_bridge: Registered OnKey script: scripts/OnKey/%s bound to '%s' (VK 0x%X mods 0x%X)",
+                temp_files[i].rel_path, key_name, vk, mods);
+
+        built++;
     }
 
-    CreateThread(NULL, 0, LoaderKeyThread, NULL, 0, NULL);
-    m2_logf("[*] lua_bridge: Spawning background hotkey polling thread");
+    if (i < file_count) {
+        m2_logf("[!] lua_bridge: scripts/OnKey/ has more than %d scripts — %d were "
+                "not registered", MAX_SCRIPTS, file_count - i);
+    }
+
+    /* Warn about shared bindings. Multiple scripts on one key is a supported
+     * feature, but it is also what an accidental KEYVAL collision looks like,
+     * and nothing used to say so. */
+    for (i = 0; i < built; ++i) {
+        for (j = i + 1; j < built; ++j) {
+            if (rebuilt[i].vk_code != 0 &&
+                rebuilt[i].vk_code == rebuilt[j].vk_code &&
+                rebuilt[i].mods    == rebuilt[j].mods) {
+                m2_logf("[!] lua_bridge: OnKey '%s' is bound to BOTH %s and %s — "
+                        "both will run on every press. Intentional? If not, "
+                        "change one binding in lua_loader.ini.",
+                        rebuilt[i].key_name, rebuilt[i].rel_path, rebuilt[j].rel_path);
+            }
+        }
+    }
+
+    if (g_keyScriptMtxInit) EnterCriticalSection(&g_keyScriptMtx);
+    memcpy(g_KeyScripts, rebuilt, (size_t)built * sizeof(LuaKeyScript));
+    g_KeyScriptCount = built;
+    if (g_keyScriptMtxInit) LeaveCriticalSection(&g_keyScriptMtx);
+
+    if (!g_keyThreadStarted) {
+        g_keyThreadStarted = 1;
+        CreateThread(NULL, 0, LoaderKeyThread, NULL, 0, NULL);
+        m2_logf("[*] lua_bridge: Spawning background hotkey polling thread");
+    } else {
+        m2_logf("[*] lua_bridge: OnKey table rescanned (%d scripts); polling thread "
+                "already running", built);
+    }
 }
 
 static void RegisterTcpLib(void* L) {
@@ -1807,6 +2682,31 @@ static int LuaLoaderPrintf(void* L) {
         ws_broadcast_typed_line("log", msg, body_len);
     }
     return 0;
+}
+
+/* Emit one line on the same two live channels Loader.Printf uses — the
+ * lua_loader_printf.log file and the WS {type:"log"} feed. Lets the loader
+ * surface OnBoot/OnLoad script results to whatever is connected instead of
+ * burying them in lua_bridge_DEV.log. */
+static void LoaderLogLine(const char* line) {
+    char   msg[2048];
+    DWORD  written;
+    size_t len;
+
+    if (!line) return;
+    len = strlen(line);
+    if (len > sizeof(msg) - 3) len = sizeof(msg) - 3;
+    memcpy(msg, line, len);
+
+    if (g_LoaderPrintfLog != INVALID_HANDLE_VALUE && g_LoaderPrintfMtxInit) {
+        msg[len]     = '\r';
+        msg[len + 1] = '\n';
+        EnterCriticalSection(&g_LoaderPrintfMtx);
+        WriteFile(g_LoaderPrintfLog, msg, (DWORD)(len + 2), &written, NULL);
+        LeaveCriticalSection(&g_LoaderPrintfMtx);
+    }
+    /* WS side is length-delimited, so ship the body without the CRLF. */
+    ws_broadcast_typed_line("log", msg, len);
 }
 
 /* ------------------------------------------------------------------------ *
@@ -2296,6 +3196,126 @@ static int LuaLoaderLoadVar(void* L) {
     return 1;
 }
 
+/* ------------------------------------------------------------------------ *
+ * Loader.GetLoadPhase() -> nIndex, sName
+ *
+ * How far the world load has progressed, on loadprobe's 0..20 ladder.
+ * Returns -1, "none" before anything has been observed. The two values a
+ * script usually cares about:
+ *     11 "Player spawn"                     -- the local player exists
+ *     20 "World fully loaded (GlobalExit)"   -- control is with the player
+ *
+ * Lets a script check it is actually in a world before touching entities,
+ * instead of inferring it from whether an OnLoad hook has run yet. Reset
+ * when a new load cycle is detected, so it tracks the CURRENT load rather
+ * than sticking at the high-water mark for the process.
+ *
+ * Requires loader_track_phase = 1 (the default); reports -1 when off.
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderGetLoadPhase(void* L) {
+    char* Lc  = (char*)L;
+    char* top = *(char**)(Lc + LUA_OFF_TOP);
+    int   ph  = (int)g_loadPhase;
+    const char* name = (ph >= 0) ? m2_loadtrigger_phase_name(ph) : "none";
+    size_t n = strlen(name);
+
+    if (n > sizeof(g_phaseNameTString.data) - 1) n = sizeof(g_phaseNameTString.data) - 1;
+    memcpy(g_phaseNameTString.data, name, n);
+    g_phaseNameTString.data[n] = '\0';
+    g_phaseNameTString.len     = (uint32_t)n;
+
+    /* lua_Number is float in this build — see FormatTValue. */
+    *(float*)top                    = (float)ph;
+    *(int*)(top + TVALUE_TT_OFFSET) = LUA_TNUMBER;
+    top += TVALUE_SIZE;
+    *(void**)top                    = &g_phaseNameTString;
+    *(int*)(top + TVALUE_TT_OFFSET) = LUA_TSTRING;
+    top += TVALUE_SIZE;
+    *(char**)(Lc + LUA_OFF_TOP)     = top;
+    return 2;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Loader.LoadFile(sRelPath) -> bLoaded
+ *
+ * Execute another .lua, resolved relative to <game>/scripts/, on the current
+ * VM. The point is shared library code: before this, the only way for two
+ * scripts to share anything was to leave it in _G from an OnBoot script,
+ * which the engine wipes on a menu return. Pair it with the '_'-prefixed
+ * directory convention — files under e.g. scripts/OnLoad/_lib/ are skipped
+ * by the folder scanner, so they only run when something asks for them:
+ *
+ *     Loader.LoadFile("OnLoad/_lib/util.lua")
+ *
+ * Returns true if the file was found and executed (its own runtime errors
+ * are logged, and reported on the Loader.Printf / WS channels, rather than
+ * failing the call). Constraints:
+ *   - relative paths under scripts/ only; absolute paths and '..' rejected
+ *   - one level deep — a LoadFile from inside a LoadFile is refused, which
+ *     also stops a file that loads itself from running away
+ *
+ * Runs synchronously on the calling VM, using its own source buffer so the
+ * caller's chunk text stays intact. LuaDoStringEx saves and restores both
+ * L->base and L->top, so the C-function frame we were called in is
+ * undisturbed.
+ * ------------------------------------------------------------------------ */
+static int LuaLoaderLoadFile(void* L) {
+    char  rel[MAX_PATH];
+    char* Lc;
+    char* top;
+    int   ok = 0;
+
+    if (!L) return 0;
+    if (m2_lua_nargs(L) < 1) return 0;
+    if (m2_lua_arg_string(L, 0, rel, sizeof(rel)) <= 0) return 0;
+
+    if (g_loadFileDepth > 0) {
+        m2_logf("[!] lua_bridge: Loader.LoadFile('%s') refused — a LoadFile is "
+                "already in progress (nesting is not supported)", rel);
+    } else if (rel[0] == '\0' || rel[1] == ':' || rel[0] == '\\' ||
+               rel[0] == '/'  || strstr(rel, "..")) {
+        m2_logf("[!] lua_bridge: Loader.LoadFile('%s') refused — must be a path "
+                "relative to scripts/ with no '..' segments", rel);
+    } else {
+        char   exe_dir[MAX_PATH];
+        char   full[MAX_PATH];
+        char*  slash;
+        char*  code;
+        size_t code_len = 0;
+        static char result_buf[4096];
+
+        GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
+        slash = strrchr(exe_dir, '\\');
+        if (slash) *(slash + 1) = '\0';
+        snprintf(full, sizeof(full), "%sscripts\\%s", exe_dir, rel);
+
+        code = LoadScriptBytes(full, "LoadFile", &code_len);
+        if (code) {
+            g_loadFileDepth++;
+            LuaDoStringEx(L, code, code_len, result_buf, sizeof(result_buf),
+                          &g_loadFileChunkSource);
+            g_loadFileDepth--;
+            free(code);
+
+            m2_logf("[*] lua_bridge: Loader.LoadFile('%s') -> %s", rel, result_buf);
+            {
+                char line[1024];
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[LoadFile] %s -> %s", rel, result_buf);
+                LoaderLogLine(line);
+            }
+            ok = 1;
+        }
+    }
+
+    Lc  = (char*)L;
+    top = *(char**)(Lc + LUA_OFF_TOP);
+    *(int*)top                      = ok ? 1 : 0;
+    *(int*)(top + TVALUE_TT_OFFSET) = LUA_TBOOLEAN;
+    *(char**)(Lc + LUA_OFF_TOP)     = top + TVALUE_SIZE;
+    return 1;
+}
+
 static const luaL_Reg loader_lib[] = {
     {"Printf",           LuaLoaderPrintf},
     {"WsSend",           LuaLoaderWsSend},
@@ -2306,6 +3326,8 @@ static const luaL_Reg loader_lib[] = {
     {"IsGameFocused",    LuaLoaderIsGameFocused},
     {"SaveVar",          LuaLoaderSaveVar},
     {"LoadVar",          LuaLoaderLoadVar},
+    {"GetLoadPhase",     LuaLoaderGetLoadPhase},
+    {"LoadFile",         LuaLoaderLoadFile},
     {NULL, NULL}
 };
 
@@ -3257,7 +4279,9 @@ static void ws_serve_client(SOCKET c) {
         }
 
         InQueuePush(code, strlen(code), 1);       /* from_ws=1 — skip g_outBuf fanout */
-        m2_logf("[+] lua_bridge: ws: queued chunk (id=%s, %zu bytes)", id, strlen(code));
+        /* %lu not %zu — wvsprintfA drops %z and printed the literal "zu". */
+        m2_logf("[+] lua_bridge: ws: queued chunk (id=%s, %lu bytes)",
+                id, (unsigned long)strlen(code));
 
         ack_len = _snprintf_s(ack, sizeof(ack), _TRUNCATE,
                               "{\"type\":\"ack\",\"id\":\"%s\",\"status\":\"queued\"}", id);
@@ -3458,7 +4482,8 @@ static DWORD WINAPI BridgeServerThread(LPVOID arg) {
                     memcmp(p, BRIDGE_SENTINEL, line_len) == 0) {
                     /* Submit accumulated chunk */
                     if (chunk_len > 0) {
-                        m2_logf("[+] lua_bridge: queued chunk (%zu bytes)", chunk_len);
+                        m2_logf("[+] lua_bridge: queued chunk (%lu bytes)",
+                                (unsigned long)chunk_len);
                         InQueuePush(chunk_buf, chunk_len, 0);
                         OutAppend("[queued]", 8);
                     }
@@ -3521,6 +4546,23 @@ static void OnIniKV(void* ud, const char* key, const char* value) {
         if (g_watchdog_stuck_ms < 0) g_watchdog_stuck_ms = 0;
     } else if (_stricmp(key, "websocket_enabled") == 0) {
         g_ws_enabled = atoi(value);
+    } else if (_stricmp(key, "loader_onkey_require_focus") == 0) {
+        g_loader_onkey_require_focus = atoi(value);
+    } else if (_stricmp(key, "loader_onkey_exact_modifiers") == 0) {
+        g_loader_onkey_exact_modifiers = atoi(value);
+    } else if (_stricmp(key, "loader_rearm_on_menu") == 0) {
+        g_loader_rearm_on_menu = atoi(value);
+    } else if (_stricmp(key, "loader_track_phase") == 0) {
+        g_loader_track_phase = atoi(value);
+    } else if (_stricmp(key, "loader_source_encoding") == 0) {
+        /* Accept the words as well as 0/1 — "auto" and "off" read better in
+         * an ini than a bare digit for something that isn't a toggle. */
+        if (_stricmp(value, "auto") == 0)      g_loader_source_encoding_auto = 1;
+        else if (_stricmp(value, "off") == 0 ||
+                 _stricmp(value, "raw") == 0)  g_loader_source_encoding_auto = 0;
+        else                                   g_loader_source_encoding_auto = atoi(value);
+    } else if (_stricmp(key, "stack_diag") == 0) {
+        g_stack_diag = atoi(value);
     }
 }
 
@@ -3550,7 +4592,11 @@ static const char kDefaultIni[] =
     "; Load scripts in scripts/OnLoad/ once game enters world (1 = enabled, 0 = disabled)\n"
     "loader_onload = 1\n"
     "\n"
-    "; Delay (in milliseconds) between executing consecutive scripts\n"
+    "; DEPRECATED in v0.5.0 and now a no-op. ExecuteLuaFolder runs ON the game\n"
+    "; thread, so sleeping between scripts could never let the engine settle\n"
+    "; the way this name suggests -- the engine IS the thread being slept. All\n"
+    "; it bought was a delay * (scripts-1) freeze on top of every load. Still\n"
+    "; parsed so existing .ini files stay valid.\n"
     "loader_delay_ms = 50\n"
     "\n"
     "; Minimum time (in milliseconds) between the SAME OnKey script re-firing.\n"
@@ -3575,7 +4621,51 @@ static const char kDefaultIni[] =
     "; JSON messages: {type:\"ack\"}, {type:\"log\"} (mirrors Loader.Printf),\n"
     "; and {type:\"ws\"} (the hidden Loader.WsSend channel). Disable this if\n"
     "; you want the bridge locked to raw-TCP only.\n"
-    "websocket_enabled = 1\n";
+    "websocket_enabled = 1\n"
+    "\n"
+    "; --- added in v0.5.0 ---\n"
+    "\n"
+    "; Drop OnKey hotkey fires while the game is NOT the foreground window.\n"
+    "; Before 0.5.0 hotkeys fired regardless of focus, so pressing F5 in a\n"
+    "; browser (refresh) or F11 (fullscreen) silently ran your game scripts in\n"
+    "; the background. Loader.PopKeyEvents has always been focus-gated; this\n"
+    "; makes the .lua-firing path agree with it. 0 = old behavior.\n"
+    "loader_onkey_require_focus = 1\n"
+    "\n"
+    "; Require the held modifier set to match a binding EXACTLY, so you can\n"
+    "; bind `F5` and `ctrl+F5` to two different scripts. Side effect: a plain\n"
+    "; `F5` binding no longer fires while ctrl/shift/alt is held. 0 = ignore\n"
+    "; modifiers entirely (pre-0.5.0 matching).\n"
+    "loader_onkey_exact_modifiers = 1\n"
+    "\n"
+    "; Re-run OnBoot/OnLoad after a main-menu round-trip. The engine wipes _G\n"
+    "; when you exit to the menu and builds fresh Lua VMs on the next load, so\n"
+    "; without this every OnLoad-installed framework stays dead until you\n"
+    "; restart the game. Detected by watching for a world-load-start marker\n"
+    "; after the world had already finished loading. 0 = once per process.\n"
+    "loader_rearm_on_menu = 1\n"
+    "\n"
+    "; Track the world-load phase ladder (0..20) so Loader.GetLoadPhase()\n"
+    "; works and the re-arm above can see a load restart. Costs a substring\n"
+    "; scan per captured game log line on the detour path. 0 removes that cost\n"
+    "; but disables GetLoadPhase and the menu re-arm.\n"
+    "loader_track_phase = 1\n"
+    "\n"
+    "; Source-encoding normalization for .lua files and WS-submitted chunks.\n"
+    "; The engine's text renderers consume single-byte CP1252, so a UTF-8\n"
+    "; source file renders \"Mobius\" (o-umlaut) as \"MA-bius\". auto strips BOMs\n"
+    "; and transcodes UTF-8 -> CP1252 only when the bytes are valid UTF-8 AND\n"
+    "; contain a byte >= 0x80, so pure-ASCII and already-ANSI files are never\n"
+    "; touched. off = raw bytes through (BOMs are still stripped, because a\n"
+    "; BOM is an unconditional Lua syntax error).\n"
+    "loader_source_encoding = auto\n"
+    "\n"
+    "; One-shot Lua stack-layout dump on the first chunk execution. This build\n"
+    "; of Lua leaves a table where stock pcall leaves its boolean status, and\n"
+    "; the status is not in the window the bridge reads — this dump exists to\n"
+    "; find where it went, and to confirm it is NOT being written into the\n"
+    "; engine's own stack frame. Costs one burst of log lines per process.\n"
+    "stack_diag = 1\n";
 
 static void EnsureIniDefault(const char* path) {
     FILE* f = fopen(path, "r");
@@ -3622,9 +4712,12 @@ static DWORD WINAPI WorkerThread(LPVOID arg) {
     InitializeCriticalSection(&g_outMtx);
     InitializeCriticalSection(&g_keyEventMtx);
     g_keyEventMtxInit = 1;
+    InitializeCriticalSection(&g_keyScriptMtx);
+    g_keyScriptMtxInit = 1;
     InitChunkSource();
     InitKeyboardStateTString();
     InitKeyEventsTString();
+    InitPhaseNameTString();
     InitLoaderPrintfLog();
     InitDataDict();
 

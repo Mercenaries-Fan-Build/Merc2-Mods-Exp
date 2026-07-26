@@ -2,6 +2,83 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.5.0] - 2026-07-25
+
+Only `lua-bridge-DEV` bumped (0.4.1 → 0.5.0). Version-family boundary: `v0.5` is a **reliability pass on the loader half** of the mod, which had not had the same scrutiny as the bridge half. Most of what follows was found by driving a live session over the REPL rather than by reading the source, and several are long-standing bugs rather than new features. Every behavior change ships with an ini lever that restores the pre-0.5.0 behavior.
+
+### Fixed
+
+- **`OnBoot`/`OnLoad` never re-ran after a main-menu round-trip.** Exiting to the main menu wipes `_G`, and the next load builds fresh `lua_State`s — measured: two new VMs per load, distinct from the boot pair. Both hooks were guarded by once-per-process statics, so everything a startup script installed was silently gone and stayed gone until the game process restarted. Confirmed live: a planted `_G` sentinel and a 616 KB framework loaded from `OnLoad` were both `nil` after a menu trip, with only one `OnLoad milestone` line in the log across four VM captures.
+  - Detection hangs off **`CaptureL` seeing a fresh `lua_State`** — since a menu round-trip demonstrably builds new VMs, a previously-unseen `L` arriving after a load cycle has already completed *is* the "we started over" signal, and it costs nothing because that slow path only runs for genuinely new VMs. Boot is not a false positive: the initial boot's second VM appears before OnLoad has executed, so the guard excludes it. (The first cut of this release detected it by watching every game log line for a load-start marker instead. That cost ~2 FPS and was replaced — see the perf note below.)
+  - Level-to-level transitions do **not** wipe `_G` and correctly do **not** re-trigger.
+  - `scripts/OnKey/` is re-scanned at the same time, so a `.lua` added mid-session is picked up without a restart. `InitializeKeyScripts` is now safe to call repeatedly — it spawns its polling thread once (the pre-0.5.0 `CreateThread` was unconditional, so a second call would have left two pollers running and fired every hotkey twice) and swaps the table under a new lock.
+  - Lever: `loader_rearm_on_menu = 0`.
+
+- **`OnKey` hotkeys fired while the game was in the background.** `LoaderKeyEventThread` (which feeds `Loader.PopKeyEvents`) had always been focus-gated and the README advertised that; `LoaderKeyThread`, which runs whole `.lua` files, was not. Pressing `F5` in a browser to refresh a page, or `F11` to go fullscreen, silently ran game scripts. Now gated on the same `IsGameFocused()` predicate, with edge state cleared on focus loss so refocusing with a key held doesn't fire on a stale transition. Lever: `loader_onkey_require_focus = 0`.
+
+- **Every chunk result carried a junk `<table>` prefix, and `[ok]` was unreachable.** This build's `luaB_pcall` leaves a **table** in slot 0 with the chunk's real results from slot 1 up — the boolean status stock `luaB_pcall` `lua_insert`s at index 1 is not anywhere in the window the executor reads. Since `tt0` matched neither the boolean nor the number branch, `have_status` stayed 0, `first_result` stayed 0, and the label stayed `[runtime]` on *every execution since this code shipped* — including successful ones. Verified across 12 probes (`return` with 0/1/3 values; nil/boolean/number/table/function returns all landed at slot 1+, and `return print` correctly rendered `<function>`, ruling out a misreported residual).
+  - Slot 0 is now recognized as an artifact and skipped when it holds a table or function — neither can be a pcall status.
+  - **`[ok]` now works.** The status turned out to live at `saved_base[0]`, and it is a real status, not a fixed marker: correlated over 8 live samples, `val=0` for exactly the chunk that failed and `val=1` for every chunk that succeeded. The executor reads it there (just before restoring the engine's frame — see the next entry) and the label is finally accurate. The stock-layout `new_base[0]` boolean/number branches are retained so adding an RVA table for another binary doesn't require rediscovering any of this.
+  - **Output-shape note:** the formatter separates values with `succeeded ? '\t' : ' '`. With `succeeded` permanently 0, every result until now used a space; successful results now use a tab, as the code always intended. Consumers splitting on generic whitespace are unaffected; anything splitting on tab specifically will see different fields.
+
+- **Every chunk execution corrupted the hooked function's stack frame.** The hunt for the missing pcall status found something worse. `STACKDIAG` proved, across 8 samples, that this build's `luaB_pcall` writes its boolean status to **`saved_base[0]`** — the base of the frame belonging to the hooked C function the bridge is executing inside — rather than the `new_base` the executor installs. The slot went in as a string (`tt=4`), a table (`tt=5`), or lightuserdata (`tt=2`) and came out boolean `true` every single time; the three samples that logged "unchanged" were the ones already clobbered by an earlier execution.
+  - Because each detour calls the original function *after* `GatedPump`, that original then read a replaced argument 1. A `type(x)` dispatched through the hooked `luaB_type` would answer `"boolean"` regardless of `x`, for any stock game script unlucky enough to share a detour call with a chunk execution. This has been happening on every chunk since the executor shipped, and is a plausible contributor to the intermittent misbehavior the watchdog was built to survive.
+  - Fixed by snapshotting the frame slots below `new_base` before the call and restoring them after — exact, and a couple of TValues of copying each way. Results live at `new_base` and above, so the restore cannot disturb them. Measured `base_delta` is 4 slots; the snapshot is capped at 16 as a bound on a value we don't control.
+
+- **The watchdog was blind to hangs in loader scripts.** `ExecuteLuaFolder` set `t_inBridgeExec` but never `g_bridgeExecStartTick`, so the hung-inside-exec path added in v0.3.1 could not see a hung `OnBoot`/`OnLoad` script — exactly the failure it was written to catch, since a blocked game thread also stops the detours Path B depends on. Additionally the watchdog bailed early on `g_PendingScripts <= 0`, which is *always* true for loader scripts (they bypass the queue entirely). Path A no longer consults `g_PendingScripts`; Path B keeps the guard, where it's meaningful.
+
+- **`g_seenL` exhausted after a handful of menu visits, silently.** Two new VMs per load against 8 fill-and-stop slots. Once full, `CaptureL` returned *before* the four `Register*` calls — the comment claimed it only dropped a log line, but it dropped lib registration too, and the fast-path `g_seenL[i] == L` match could never hit again, so every subsequent detour fire on a new VM paid the full 4-syscall `LooksLikeLuaState`. That silently discards the single biggest hot-path win the v0.3.0 notes describe. Now a 16-slot ring with oldest-eviction, registration hoisted above the bookkeeping, and the scan no longer breaks at the first `NULL` (only safe while the table filled strictly front-to-back).
+
+- **`loader_delay_ms` froze the game for no benefit.** `ExecuteLuaFolder` runs on the game thread, so `Sleep()`ing between scripts could not let the engine settle — the engine is the thread being slept. All it bought was a `delay × (scripts−1)` stall on top of every load. Now a no-op; still parsed so existing `.ini` files stay valid, and documented as deprecated.
+
+- **`m2_logf` silently corrupted C99 format specifiers.** It goes through `wvsprintfA`, which supports neither `%zu` nor `%ll` nor width specifiers, and emits the literal text instead. Three call sites were affected. The worst was the binary fingerprint, which printed `0xlX` — and the header comment tells you to read that value off the log in order to add support for a new executable, so the documented procedure for supporting a new binary had never worked. Now split into two `%08lX` halves; the two `%zu` sizes are cast to `unsigned long`.
+
+- **Nested `ExecuteLuaFolder` was possible.** `GatedPump`'s OnLoad branch didn't consult `t_inBridgeExec`, so `OnLoad` could begin while an `OnBoot` script was still on the stack. Now guarded in both places.
+
+### Added
+
+- **Source-encoding normalization.** The engine's text renderers consume strings as single-byte **CP1252** — verified live against both the native `MrxGui.TextWidget` font path and the Scaleform `.gfx` path — so a `.lua` saved as UTF-8 puts two bytes (`C3 B6`) where the renderer wants one (`F6`) and `Möbius` renders as `MÃ¶bius`. The bridge itself was never corrupting anything; it is byte-transparent end to end, which is why this is fixed at load time rather than in the render path.
+  - One `LoadScriptBytes()` chokepoint replaces the two near-identical `fopen`/`fread` blocks in `ExecuteLuaFolder` and `LoaderKeyThread`.
+  - BOMs are stripped **unconditionally**, even with normalization off: a UTF-8 BOM is a hard Lua 5.1 syntax error and editors add one silently. UTF-16 BOMs get an explicit "re-save as ANSI or UTF-8" line instead of being fed to the parser as garbage.
+  - UTF-8 → CP1252 runs only when the bytes are valid UTF-8 (probed with `MB_ERR_INVALID_CHARS`, which fails on CP1252 input — exactly the discriminator needed) **and** contain a byte ≥ 0x80. Pure-ASCII files are bit-identical in both encodings and never touched; already-CP1252 files fail the probe and pass through. Characters with no CP1252 equivalent are logged rather than silently becoming `?`.
+  - `lua_console.py` sent UTF-8 too, and now uses CP1252 in both directions.
+  - Lever: `loader_source_encoding = off`.
+- **`Loader.GetLoadPhase()` → `nIndex, sName`** — position on loadprobe's 0..20 world-load ladder, so a script can confirm it is in a world before touching entities. Fed from the existing noop-stub detour, **not** `m2_loadtrigger_install()`: that MinHooks `M2_LOG_STUB_VA`, which is the same address this mod already detours (`0x006D5640` on v1.1+bypass), so installing it would double-hook a target we own. Only the ladder data and `m2_loadtrigger_phase_name()` are reused. Scanning is confined to the duration of a load — it stops at phase 20 and re-arms for the next load — so the cost sits inside a loading screen rather than the steady-state frame loop. Lever: `loader_track_phase = 0`.
+- **`Loader.LoadFile(sRelPath)`** — execute another `.lua` relative to `<game>/scripts/` on the current VM, synchronously. Gives scripts a way to share library code, which previously only existed via `_G` pollution from `OnBoot` — and that gets wiped. Uses its own chunk-source buffer so it can't clobber the source text of the chunk that called it; rejects absolute paths and `..`, and refuses to nest (which also stops a file that loads itself).
+- **Modifier combinations in hotkey bindings** — `ctrl+`, `shift+`, `alt+` in any order (`KEYVAL = "ctrl+F5"`). Modifiers must match exactly so `F5` and `ctrl+F5` can drive different scripts; `loader_onkey_exact_modifiers = 0` restores modifier-insensitive matching.
+- **Many more bindable keys** — `numpad0`–`numpad9` and the numpad operators, `F13`–`F24`, `capslock`/`numlock`/`scrolllock`/`pause`/`printscreen`, left/right-specific modifiers, the full punctuation/OEM set including `tilde` (the traditional console key, previously unbindable — which is what pushed people onto the F-keys browsers also claim), and `mouse4`/`mouse5`. Purely additive: every pre-0.5.0 name resolves identically.
+- **`_`-prefixed directories are not scanned**, so shared library code can live at e.g. `scripts/OnLoad/_lib/` and be pulled in with `Loader.LoadFile` instead of auto-running. Previously the recursive scan picked up everything, so there was nowhere to put a non-auto-run `.lua`.
+- **Per-script disable** — `off`, `no`, or `disabled` as a script's value in `lua_loader.ini` skips it without deleting the file. Deliberately *not* repurposing `0`, which existing configs may contain and which currently means "run first".
+- **Loader script results reach live clients.** `OnBoot`/`OnLoad`/`LoadFile` results now go to the `Loader.Printf` log and the WS `{type:"log"}` feed, not just `lua_bridge_DEV.log` — a connected REPL or browser never saw a startup-script failure before. `result_buf` also raised from 4 KB to `PumpQueue`'s 16 KB, since it was silently truncating longer results and error messages.
+
+### Performance
+
+- **The noop-stub detour stays off the per-frame budget.** `Debug.Printf` and ~700 other stripped log functions funnel through that stub thousands of times per frame from stock scripts, so anything unconditional in it is measurable. Pre-0.5.0 the `m2_lua_join_strings` call there stopped entirely once the OnLoad milestone was seen; the first cut of this release reintroduced it permanently to feed phase tracking, which showed up in testing as a drop from a locked 60 FPS to ~58. Both consumers now gate themselves off: the OnLoad trigger stops at its milestone as before, and phase tracking stops at the fully-loaded phase and is re-armed per load cycle. Steady-state gameplay is back to two volatile loads and a `GetTickCount()`, matching pre-0.5.0. The re-arm detection moved to the free `CaptureL` signal in the same pass.
+
+### Changed / hardened
+
+- Script scanning: junctions and symlinks are skipped outright (a junction pointing at an ancestor was an unbounded recursion, and each level costs ~600 bytes of *game-thread* stack), with an 8-level depth cap behind it. The two `LuaScriptFile[128]` arrays (~67 KB each) and `LuaKeyScript[128]` (~78 KB) moved off the stack to statics, protected by the new nesting guard. Hitting `MAX_SCRIPTS` is now reported instead of silently dropping files.
+- Unrecognized `OnKey` key names log a loud warning naming the valid forms. Previously a typo like `pgup` or `F13` resolved to VK 0 and simply never fired, looking identical to a working binding in the log.
+- Two scripts sharing one binding is logged at registration. It's a supported feature, but it's also what an accidental `KEYVAL` collision looks like, and nothing said so.
+- The oversize-script cap is now `sizeof(g_chunkSource.data)` rather than a separate 1 MB constant, so "the loader accepted it" and "the executor will run it" can't disagree — and going over is logged rather than silently skipped.
+- `lua_loader.ini` dropped from the shipped `assets[]`. Shipping it defeated `EnsureLoaderIniHeader`, which early-returns when the file exists — so users got a stripped copy referencing three sample scripts that aren't in the zip, and never saw the commented VK-code reference the code takes care to write. Existing installs keep their file untouched.
+
+### Notes for script authors
+
+- **String escapes in this build are OCTAL, not decimal.** Stock Lua 5.1 reads `"\ddd"` as decimal; this build reads base 8 and does not reject the digits 8 or 9. `ö` is `"\366"`, not `"\246"` (which yields `0xA6`). `"\9"` is a tab; `"\195"` is `0x8D`. Live-verified with `"\101"` → `"A"` (65), where decimal would have given `e`. `"M\366bius"` in an ASCII-only file is the dependency-free way to write an accented string.
+
+### Verification
+
+- Built clean with `i686-w64-mingw32-gcc` 16.1.0; no new warning *classes* versus baseline (the original source was compiled for comparison — same two, `-Wstringop-truncation` and `-Wformat-truncation`, with higher counts only from more code of the same safe `strncpy(dst, src, sizeof-1)` + explicit-NUL shape).
+- Live-tested throughout against v1.1 + mercs2-securom-bypass:
+  - 12 stack-layout probes establishing that results start at slot 1.
+  - 4 escape-encoding probes establishing the octal behavior (`"\101"` → `"A"`).
+  - A two-variant on-screen render comparison through `MrxGui.TextWidget` confirming the single-byte CP1252 target, agreeing with the `.gfx` path.
+  - 8 `STACKDIAG` samples proving the engine-frame corruption, then 8 more confirming the restore holds (`UNCHANGED` on every sample, original types preserved).
+  - Status correlation over a known-good/known-bad chunk set.
+  - Full main-menu round-trip: `_G` confirmed wiped, re-arm fired off the fresh-VM signal, `OnKey` table rescanned without a duplicate polling thread, OnLoad re-ran, and the `Ess` framework came back as a live table where it was `nil` before.
+  - Framerate confirmed back to a locked 60 after the hot-path regression was fixed.
+
 ## [v0.4.1] - 2026-07-17
 
 Only `lua-bridge-DEV` bumped (0.4.0 → 0.4.1). Adds concurrent WebSocket clients — same wire contract, no user-facing API changes, no config change.

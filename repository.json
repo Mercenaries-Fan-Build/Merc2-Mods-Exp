@@ -9,9 +9,9 @@
       "slug": "lua-bridge-DEV",
       "name": "Lua Bridge (DEV)",
       "type": "asi",
-      "description": "Exposes the game's internal Lua state over a localhost TCP port OR WebSocket (auto-detected). Ships a stock-parity math library, keyboard/focus API, persistent SaveVar/LoadVar, self-healing watchdog, and the Loader utility namespace (Printf + WsSend hidden channel).",
-      "version": "0.4.1",
-      "assets": ["lua_bridge_DEV.asi", "lua_bridge_DEV.ini", "lua_loader.ini", "lua_console.py"]
+      "description": "Exposes the game's internal Lua state over a localhost TCP port OR WebSocket (auto-detected). Ships a stock-parity math library, keyboard/focus API, persistent SaveVar/LoadVar, self-healing watchdog, source-encoding normalization, load-phase tracking, and the Loader utility namespace (Printf + WsSend hidden channel).",
+      "version": "0.5.0",
+      "assets": ["lua_bridge_DEV.asi", "lua_bridge_DEV.ini", "lua_console.py"]
     },
     {
       "slug": "debug-overlay-DEV",
