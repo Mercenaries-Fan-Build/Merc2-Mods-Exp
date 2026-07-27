@@ -497,6 +497,14 @@ static volatile LONG g_PendingScripts = 0;
 static volatile LONG g_OnLoadTriggered = 0;
 static volatile LONG g_OnLoadExecuted  = 0;
 
+/* Bumped by RearmLoaderForNewLoadCycle. The load-milestone scan in
+ * DetourNoopStub keeps its give-up state in a static local, which nothing
+ * outside that function could reach — so once the scan gave up it stayed given
+ * up for the rest of the session, and its own log line promising "a real level
+ * load will re-enable it" was not true. The scan compares this against the
+ * generation it last saw and rearms when they differ. */
+static volatile LONG g_scanRearmGen = 0;
+
 /* Hot-path gate. When 0, GatedPump fast-returns after a single volatile
  * load. Set to 1 whenever there might be pump work (script queued, or
  * OnLoad transition pending); recomputed from ground-truth after any
@@ -1387,6 +1395,12 @@ static void RearmLoaderForNewLoadCycle(const char* why) {
     InterlockedExchange(&g_OnLoadExecuted, 0);
     if (g_loader_onboot) InterlockedExchange(&g_onbootExecuted, 0);
 
+    /* Let the milestone scan out of a previous give-up. Without this the
+     * give-up was permanent for the session: its reset branch only runs when
+     * NEITHER gate wants the scan, and want_onload stays 1 precisely because
+     * OnLoad never fired. */
+    InterlockedIncrement(&g_scanRearmGen);
+
     /* Re-scan key bindings too — a fresh load cycle is the natural point to
      * pick up .lua files added since boot. InitializeKeyScripts() is safe to
      * call repeatedly as of v0.5.0 (it spawns its polling thread once and
@@ -1430,14 +1444,42 @@ static int __cdecl DetourNoopStub(void* L) {
          * The root causes are fixed (see g_everSeenL and InQueuePush), but a
          * cost this large should not depend solely on those being right.
          *
-         * A real load reaches the milestone in seconds, so a 60s ceiling
-         * cannot cut a legitimate load short. */
+         * THE CEILING WAS 60s AND THAT WAS TOO TIGHT. "A real load reaches the
+         * milestone in seconds" holds while the game is in the FOREGROUND; it
+         * does not when the window is backgrounded, because the game throttles
+         * hard while GetTickCount keeps counting. Alt-tabbing right after
+         * picking Continue reliably blew the budget, the scan switched off,
+         * "GlobalExit - Complete" was never seen, and OnLoad never fired — Ess
+         * simply never loaded. Reported from a repro, not theorised.
+         *
+         * Raised to 300s, which a throttled load comfortably fits inside, and
+         * the give-up is now RECOVERABLE (see g_scanRearmGen) rather than
+         * terminal for the session — which is what made a tight ceiling feel
+         * necessary in the first place.
+         *
+         * DELIBERATELY NOT focus-aware. The obvious fix is to stop spending the
+         * budget while unfocused, and it was tried: calling IsGameFocused() from
+         * here CRASHED THE GAME BEFORE THE MENU. This stub fires thousands of
+         * times per frame, so two user32 calls per fire is not a small addition
+         * — and during early boot, before the window is foreground, the budget
+         * would never elapse at all, leaving the scan running at full cost
+         * exactly as the ~2 FPS incident above describes. If focus ever needs
+         * consulting here, sample it on WatchdogThread (which already wakes
+         * every ~2s) into a volatile flag and read THAT. Never syscall from
+         * this function. */
         static DWORD scan_started_tick = 0;
         static int   scan_gave_up      = 0;
+        static LONG  scan_seen_gen     = 0;
         int want_phase  = (g_loader_track_phase &&
                            g_loadPhase < M2_PHASE_REACHED_WORLD_IDX);
         int want_onload = (g_loader_enabled && g_loader_onload &&
                            !g_OnLoadTriggered);
+
+        if (scan_seen_gen != g_scanRearmGen) {   /* a new load cycle started */
+            scan_seen_gen     = g_scanRearmGen;
+            scan_gave_up      = 0;
+            scan_started_tick = 0;
+        }
 
         if (!(want_phase || want_onload)) {
             scan_started_tick = 0;      /* settled — re-arm the budget */
@@ -1446,13 +1488,13 @@ static int __cdecl DetourNoopStub(void* L) {
             want_phase = want_onload = 0;
         } else if (scan_started_tick == 0) {
             scan_started_tick = GetTickCount();
-        } else if ((GetTickCount() - scan_started_tick) > 60000) {
+        } else if ((GetTickCount() - scan_started_tick) > 300000) {
             scan_gave_up = 1;
             want_phase = want_onload = 0;
-            m2_logf("[!] lua_bridge: load-milestone scan ran 60s without reaching "
+            m2_logf("[!] lua_bridge: load-milestone scan ran 300s without reaching "
                     "GlobalExit — disabling it to protect the frame budget "
-                    "(phase=%d OnLoadTriggered=%d). A real level load will "
-                    "re-enable it.", (int)g_loadPhase, (int)g_OnLoadTriggered);
+                    "(phase=%d OnLoadTriggered=%d). A real level load re-enables it.",
+                    (int)g_loadPhase, (int)g_OnLoadTriggered);
         }
 
         if (want_phase || want_onload) {
