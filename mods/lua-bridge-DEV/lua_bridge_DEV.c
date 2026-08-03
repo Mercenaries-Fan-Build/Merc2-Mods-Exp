@@ -1095,6 +1095,7 @@ static void RegisterLoaderLib(void* L);
 static void RegisterMathLib(void* L);
 static void RunPolyfill(void* L);
 static void ExecuteLuaFolder(void* L, const char* folder_name);
+static void RegisterLoaderFolderOnly(const char* folder_name);
 static void InitializeKeyScripts(void);
 static void LoaderLogLine(const char* line);
 static void RearmLoaderForNewLoadCycle(const char* why);
@@ -1262,6 +1263,7 @@ static int EverSeenL_CheckAndAdd(void* L) {
  * statics so RearmLoaderForNewLoadCycle() can clear them on a menu return. */
 static volatile LONG g_keyLoaderInitialized = 0;
 static volatile LONG g_onbootExecuted       = 0;
+static volatile LONG g_onloadRegistered     = 0;   /* ini entries written, not run */
 
 static void CaptureL(void* L, const char* via) {
     int i;
@@ -1339,6 +1341,17 @@ static void CaptureL(void* L, const char* via) {
         g_onbootExecuted = 1;
         ExecuteLuaFolder(L, "OnBoot");
     }
+
+    /* Register OnLoad's scripts in lua_loader.ini NOW, at launch, even though
+     * they do not run until the GlobalExit milestone. OnKey and OnBoot have
+     * always appeared in a fresh ini at startup purely because they execute at
+     * startup; OnLoad's deferred execution meant its section stayed absent, so
+     * "the loader never saw my script" and "the loader saw it but the milestone
+     * never arrived" produced an identical, empty ini. They no longer do. */
+    if (g_loader_enabled && g_loader_onload && !g_onloadRegistered) {
+        g_onloadRegistered = 1;
+        RegisterLoaderFolderOnly("OnLoad");
+    }
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1407,6 +1420,11 @@ static void RearmLoaderForNewLoadCycle(const char* why) {
      * swaps the table under a lock). */
     InterlockedExchange(&g_keyLoaderInitialized, 0);
 
+    /* Same reasoning for the OnLoad registration pass: a fresh load cycle is
+     * the natural point to pick up a .lua dropped in since boot, and the ini
+     * should show it before the milestone rather than after. */
+    InterlockedExchange(&g_onloadRegistered, 0);
+
     g_hotWork = 1;
 }
 
@@ -1470,6 +1488,7 @@ static int __cdecl DetourNoopStub(void* L) {
         static DWORD scan_started_tick = 0;
         static int   scan_gave_up      = 0;
         static LONG  scan_seen_gen     = 0;
+        static int   scan_saw_load     = 0;
         int want_phase  = (g_loader_track_phase &&
                            g_loadPhase < M2_PHASE_REACHED_WORLD_IDX);
         int want_onload = (g_loader_enabled && g_loader_onload &&
@@ -1479,22 +1498,56 @@ static int __cdecl DetourNoopStub(void* L) {
             scan_seen_gen     = g_scanRearmGen;
             scan_gave_up      = 0;
             scan_started_tick = 0;
+            scan_saw_load     = 0;
         }
 
         if (!(want_phase || want_onload)) {
             scan_started_tick = 0;      /* settled — re-arm the budget */
             scan_gave_up      = 0;
+            scan_saw_load     = 0;
         } else if (scan_gave_up) {
             want_phase = want_onload = 0;
-        } else if (scan_started_tick == 0) {
-            scan_started_tick = GetTickCount();
-        } else if ((GetTickCount() - scan_started_tick) > 300000) {
-            scan_gave_up = 1;
-            want_phase = want_onload = 0;
-            m2_logf("[!] lua_bridge: load-milestone scan ran 300s without reaching "
-                    "GlobalExit — disabling it to protect the frame budget "
-                    "(phase=%d OnLoadTriggered=%d). A real level load re-enables it.",
-                    (int)g_loadPhase, (int)g_OnLoadTriggered);
+        } else {
+            /* WHEN THE CLOCK STARTS MATTERS, and it used to start here — on the
+             * first armed fire, which is at the MAIN MENU. want_onload is true
+             * from DLL init onward, so the budget was really "menu idle + load
+             * time", and simply reading the mission briefing for five minutes
+             * before hitting Continue burned it before the load even began.
+             * Same shape as the alt-tab bug: a wall-clock bound placed on
+             * something that is not wall-clock-bounded.
+             *
+             * Worse on a FIRST load: RearmLoaderForNewLoadCycle only fires once
+             * g_OnLoadExecuted is set, so there is no rescue for the very first
+             * load of a session — the give-up would be terminal exactly when
+             * the user has never seen the framework work at all.
+             *
+             * So: the 300s is now measured from the moment a load is genuinely
+             * UNDERWAY. Until then a much longer idle budget applies, purely as
+             * the backstop for the pathological case the ceiling exists for (a
+             * spurious re-arm during steady-state gameplay, which pinned the
+             * framerate at ~25). Sitting at a menu is not that case, and it is
+             * not costing gameplay frames. */
+            DWORD now = GetTickCount();
+            int   underway = (g_loadPhase > -1) || (g_scanRearmGen > 0);
+
+            if (underway && !scan_saw_load) {
+                scan_saw_load     = 1;
+                scan_started_tick = now;   /* restart: 300s from LOAD start */
+            } else if (scan_started_tick == 0) {
+                scan_started_tick = now;
+            } else {
+                DWORD budget = scan_saw_load ? 300000 : 1800000;
+                if ((now - scan_started_tick) > budget) {
+                    scan_gave_up = 1;
+                    want_phase = want_onload = 0;
+                    m2_logf("[!] lua_bridge: load-milestone scan ran %lus without reaching "
+                            "GlobalExit — disabling it to protect the frame budget "
+                            "(phase=%d OnLoadTriggered=%d loadSeen=%d). A real level "
+                            "load re-enables it.",
+                            (unsigned long)(budget / 1000), (int)g_loadPhase,
+                            (int)g_OnLoadTriggered, scan_saw_load);
+                }
+            }
         }
 
         if (want_phase || want_onload) {
@@ -2155,35 +2208,48 @@ static char* LoadScriptBytes(const char* path, const char* what, size_t* out_len
     return buf;
 }
 
-static void ExecuteLuaFolder(void* L, const char* folder_name) {
+/* static rather than stack: 128 * sizeof(LuaScriptFile) is ~67 KB and this runs
+ * on the game thread inside a detour frame, where the remaining stack budget is
+ * not ours to assume. result_buf is also bumped to PumpQueue's 16 KB — at 4 KB
+ * it silently truncated the results and error messages of any script that
+ * returned much. Safe as statics because of g_inLoaderFolder below.
+ *
+ * File-scope rather than function-local so the register-only pass can share
+ * both the buffer and the guard with the execute pass. */
+static LuaScriptFile g_folderScripts[MAX_SCRIPTS];
+static char          g_folderResultBuf[16384];
+
+/* Re-entrancy guard. A script run from ExecuteLuaFolder can trigger a detour,
+ * and GatedPump's OnLoad branch does not consult t_inBridgeExec — so OnLoad
+ * could begin while OnBoot was still on the stack. That was always fragile;
+ * with static buffers it would be outright corruption, so refuse to nest.
+ * (GatedPump now also checks t_inBridgeExec, making this belt-and-braces rather
+ * than the only defense.) */
+static int g_inLoaderFolder = 0;
+
+/* Scan a loader folder and make sure lua_loader.ini carries an entry for every
+ * .lua in it, resolving each script's load order and disable state. Fills
+ * `scripts` and returns the count; runs NOTHING.
+ *
+ * Split out of ExecuteLuaFolder so OnLoad can be REGISTERED at launch while
+ * still being EXECUTED at the GlobalExit milestone. The two used to be one
+ * pass, which meant a fresh lua_loader.ini grew [OnKey] and [OnBoot] sections
+ * at startup but NO [OnLoad] section at all until the first successful in-world
+ * load — OnKey and OnBoot register at launch only as a side effect of running
+ * there. That made a load failure unreadable: an empty [OnLoad] looked
+ * identical whether the loader had never scanned the folder, or had scanned it
+ * and never got to run it. It is now the former only.
+ *
+ * Registration does NOT gate execution — ExecuteLuaFolder rescans and writes
+ * any still-missing entry itself, so an ini hand-stripped between launch and
+ * the milestone still runs. Callers must hold g_inLoaderFolder. */
+static int RegisterLuaFolder(const char* folder_name, LuaScriptFile* scripts, int max_count) {
     char exe_dir[MAX_PATH];
     char folder_path[MAX_PATH];
     char loader_ini_path[MAX_PATH];
     char* slash;
-    /* static rather than stack: 128 * sizeof(LuaScriptFile) is ~67 KB and
-     * this runs on the game thread inside a detour frame, where the
-     * remaining stack budget is not ours to assume. result_buf is also
-     * bumped to PumpQueue's 16 KB — at 4 KB it silently truncated the
-     * results and error messages of any script that returned much. Safe as
-     * statics because of the nesting guard directly below. */
-    static LuaScriptFile scripts[MAX_SCRIPTS];
-    static char result_buf[16384];
-    static int  in_folder = 0;
     int script_count = 0;
     int i;
-
-    /* Re-entrancy guard. A script run from here can trigger a detour, and
-     * GatedPump's OnLoad branch does not consult t_inBridgeExec — so OnLoad
-     * could begin while OnBoot was still on the stack. That was always
-     * fragile; with static buffers it would be outright corruption, so
-     * refuse to nest. (GatedPump now also checks t_inBridgeExec, making this
-     * belt-and-braces rather than the only defense.) */
-    if (in_folder) {
-        m2_logf("[!] lua_bridge: ExecuteLuaFolder(%s) re-entered while another "
-                "folder was still running — skipped", folder_name);
-        return;
-    }
-    in_folder = 1;
 
     GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
     slash = strrchr(exe_dir, '\\');
@@ -2194,18 +2260,14 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
     EnsureLoaderIniHeader(loader_ini_path);
 
     g_scanDropped = 0;
-    CollectScriptsRecursive(folder_path, "", scripts, &script_count, MAX_SCRIPTS, 0);
+    CollectScriptsRecursive(folder_path, "", scripts, &script_count, max_count, 0);
     if (g_scanDropped > 0) {
         m2_logf("[!] lua_bridge: scripts/%s/ holds more than %d .lua files — %d were "
                 "silently ignored. Raise MAX_SCRIPTS or split the folder.",
-                folder_name, MAX_SCRIPTS, g_scanDropped);
+                folder_name, max_count, g_scanDropped);
     }
 
-    if (script_count == 0) {
-        m2_logf("[*] lua_bridge: No scripts found in scripts/%s/", folder_name);
-        in_folder = 0;
-        return;
-    }
+    if (script_count == 0) return 0;
 
     qsort(scripts, script_count, sizeof(LuaScriptFile), CompareAlphabetical);
 
@@ -2240,6 +2302,52 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
     }
 
     qsort(scripts, script_count, sizeof(LuaScriptFile), CompareLoadOrder);
+    return script_count;
+}
+
+/* Register a folder's scripts in lua_loader.ini without running any of them.
+ * Used for OnLoad at launch: its execution is deferred to the GlobalExit
+ * milestone, but there is no reason its ini entries should be. */
+static void RegisterLoaderFolderOnly(const char* folder_name) {
+    int n;
+
+    if (g_inLoaderFolder) {
+        m2_logf("[!] lua_bridge: RegisterLoaderFolderOnly(%s) skipped — another "
+                "folder pass is still running", folder_name);
+        return;
+    }
+    g_inLoaderFolder = 1;
+    n = RegisterLuaFolder(folder_name, g_folderScripts, MAX_SCRIPTS);
+    g_inLoaderFolder = 0;
+
+    if (n == 0) {
+        m2_logf("[*] lua_bridge: No scripts found in scripts/%s/ (registration pass)",
+                folder_name);
+    } else {
+        m2_logf("[*] lua_bridge: Registered %d script(s) in scripts/%s/ into "
+                "lua_loader.ini — execution deferred", n, folder_name);
+    }
+}
+
+static void ExecuteLuaFolder(void* L, const char* folder_name) {
+    LuaScriptFile* scripts = g_folderScripts;
+    char* result_buf = g_folderResultBuf;
+    int script_count = 0;
+    int i;
+
+    if (g_inLoaderFolder) {
+        m2_logf("[!] lua_bridge: ExecuteLuaFolder(%s) re-entered while another "
+                "folder was still running — skipped", folder_name);
+        return;
+    }
+    g_inLoaderFolder = 1;
+
+    script_count = RegisterLuaFolder(folder_name, scripts, MAX_SCRIPTS);
+    if (script_count == 0) {
+        m2_logf("[*] lua_bridge: No scripts found in scripts/%s/", folder_name);
+        g_inLoaderFolder = 0;
+        return;
+    }
 
     /* Re-register libs before running the batch — same reasoning as
      * PumpQueue: engine may have wiped _G between capture and now. */
@@ -2294,7 +2402,7 @@ static void ExecuteLuaFolder(void* L, const char* folder_name) {
          * is still parsed so existing inis stay valid; see the ini comment. */
     }
 
-    in_folder = 0;
+    g_inLoaderFolder = 0;
 }
 
 typedef struct {

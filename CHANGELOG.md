@@ -2,6 +2,55 @@
 
 All notable changes to the Mercenaries 2 Experimental Mods project will be documented in this file.
 
+## [v0.5.4] - 2026-08-02
+
+Only `lua-bridge-DEV` bumped (0.5.3 → 0.5.4). **Second half of the "OnLoad never fired" family — if you have ever had a mod silently not load, update.** No API changes, no config changes.
+
+### Fixed
+
+- **`[OnLoad]` never appeared in a fresh `lua_loader.ini` until the first successful in-world load.** Registering a folder's scripts in the ini and executing them were the *same pass* (`ExecuteLuaFolder`), so a section only existed once that folder had run. `[OnKey]` and `[OnBoot]` populated at startup purely as a side effect of executing at startup; OnLoad's execution is deferred to the `GlobalExit - Complete` milestone, so its registration was deferred with it.
+
+  The consequence was diagnostic rather than functional, and it was expensive: an absent `[OnLoad]` looked **identical** whether the loader had never scanned the folder or had scanned it and never got to run it. Reported as "OnLoad scripts are not being detected and added to the ini" — a reasonable reading of the evidence, and the wrong one; the ini was a symptom of the load never completing, not its cause. This has been the behaviour since the loader was introduced.
+
+  `RegisterLuaFolder()` is now split out and called at launch for OnLoad, next to where OnBoot runs. Registration does **not** gate execution — `ExecuteLuaFolder` still rescans and writes anything missing, so an ini hand-stripped between launch and the milestone still runs normally. It re-registers on a load-cycle re-arm too, matching the OnKey rescan, so a `.lua` dropped in at the main menu appears without a restart.
+
+- **The milestone scan's 300s budget counted main-menu idle time.** `want_onload` is true from DLL init onward, so the clock started on the first armed detour fire — at the menu, not at load start. The budget was really "time spent reading the mission select screen, plus the load", and sitting there for five minutes exhausted it before the load began. Same shape as the v0.5.3 alt-tab bug: a wall-clock bound placed on something that is not wall-clock-bounded.
+
+  Worse on a **first** load. `RearmLoaderForNewLoadCycle` only fires once `g_OnLoadExecuted` is set, so v0.5.3's recoverable give-up has no recovery path on the first load of a session — the give-up was still terminal exactly when a user had never seen their mods work at all.
+
+  The 300s is now measured from the point a load is genuinely underway (`g_loadPhase` rising, or a re-arm). Until then a 30-minute idle budget applies, purely as the backstop for the case the ceiling exists for: a spurious re-arm during steady-state gameplay, which pinned the framerate at ~25. Sitting at a menu is not that case and is not costing gameplay frames. The give-up log line now reports which budget elapsed and whether a load had been seen.
+
+### Verification
+
+Live, against the original report: `[OnLoad]` with both scripts appeared in the ini **at the main menu**, before Continue was pressed; the milestone then fired and both scripts ran.
+
+```
+[*] Registered 2 script(s) in scripts/OnLoad/ into lua_loader.ini — execution deferred
+[*] OnLoad milestone reached (GlobalExit - Complete). Queuing OnLoad scripts.
+[*] Loading script (OnLoad): 1_Ess.lua (888590 bytes)
+[+] Script result: [ok]
+```
+
+Framework confirmed live over the bridge afterwards, not merely reported as `[ok]` by the loader.
+
+### Housekeeping
+
+- `repository.json` was still advertising 0.5.2 — v0.5.3 bumped neither it nor this file. Both are current as of this release, and v0.5.3 is backfilled below.
+
+## [v0.5.3] - 2026-07-26
+
+Only `lua-bridge-DEV` bumped (0.5.2 → 0.5.3). Backfilled: the release was tagged without a changelog entry.
+
+### Fixed
+
+- **OnLoad never fired if you alt-tabbed during a level load.** Reproduced, not theorised: pick Continue, alt-tab immediately, and the framework simply never loads. The milestone scan had a hard 60-second ceiling justified by "a real load reaches the milestone in seconds" — true in the foreground, false when backgrounded, where the game throttles hard while `GetTickCount` keeps counting.
+
+  The give-up was also **terminal for the session**: `scan_gave_up` was a static local inside the detour, so nothing outside could clear it, and its own log line promising "a real level load will re-enable it" was untrue. One alt-tab poisoned the whole session.
+
+  Ceiling raised to 300s, and the give-up made recoverable via `g_scanRearmGen`, which `RearmLoaderForNewLoadCycle` bumps and the scan compares — so the log line's promise became true. That is what makes a generous ceiling safe.
+
+  **Recorded in the source so nobody repeats it:** making the budget focus-aware is the obviously correct fix and it *crashed the game before the menu*. That stub fires thousands of times per frame; two `user32` calls per fire is not a small addition. If focus is ever needed there, sample it on `WatchdogThread` into a volatile flag and read that. Never syscall from that function.
+
 ## [v0.5.2] - 2026-07-26
 
 Only `lua-bridge-DEV` bumped (0.5.1 → 0.5.2). **Framerate regression fix — anyone on v0.5.0 or v0.5.1 should update.** No API changes, no config changes.
