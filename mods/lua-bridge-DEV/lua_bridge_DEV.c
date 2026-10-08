@@ -215,6 +215,89 @@ static BOOL SafeProbe(const void* p, size_t bytes) {
 #define LUA_TFUNCTION     6
 #define LUA_TTHREAD       8
 
+/* ------------------------------------------------------------------------ *
+ * [GCDIAG] Lua-heap diagnostic instrumentation — v0.5.4 diagnostic patch
+ *
+ * Zero behavior change — pure log emission tagged [GCDIAG]. Goal: figure out
+ * whether the reported "opening the menu N times crashes" is:
+ *   (A) engine spawns a fresh global_State per menu round-trip and never
+ *       lua_closes the old one  (l_G unique + count grows w/o bound);
+ *   (B) same global_State throughout, auto-GC not running on our chunk
+ *       allocations  (l_G stable, totalbytes climbs monotonically);
+ *   (C) same global_State, auto-GC IS running  (l_G stable, totalbytes
+ *       resets after threshold hits) — leak is elsewhere.
+ *
+ * Offsets INSIDE global_State — best-guess against stock Lua 5.1.2 layout.
+ * Pandemic patched TValue to 8 bytes but global_State's lu_mem/int fields
+ * are untouched. If the printed values look absurd (GCthreshold below
+ * totalbytes, wildly different magnitudes across two lines a millisecond
+ * apart), re-derive by reading a mercs2_probe dump against this binary
+ * and adjust the two GSTATE_OFF_* below.
+ *
+ * Filter the log with:  findstr /C:"[GCDIAG]" lua_bridge_DEV.log
+ * ------------------------------------------------------------------------ */
+#define LUA_OFF_L_G            0x10   /* lua_State -> global_State* (already used by LooksLikeLuaState) */
+#define GSTATE_OFF_GCTHRESHOLD 0x3C   /* stock 5.1.2 layout — lu_mem */
+#define GSTATE_OFF_TOTALBYTES  0x40   /* stock 5.1.2 layout — lu_mem */
+#define GSTATE_DUMP_BYTES      0x50   /* first 80 bytes covers all GC fields */
+
+#define GCDIAG_LG_SLOTS 32
+static void* g_gcdiag_lgSeen[GCDIAG_LG_SLOTS] = {0};
+static int   g_gcdiag_lgCount = 0;
+
+/* Log l_G, whether it's new to this process, the two suspected GC
+ * counters, and a raw hex dump of the first GSTATE_DUMP_BYTES of *l_G
+ * so absent-context eyeballs can spot the actually-growing counter
+ * without trusting our stock-5.1.2 guess. Safe: everything runs behind
+ * SafeProbe. Tag [GCDIAG] on every line so a grep lifts the trace. */
+static void GcDiagLog(void* L, const char* tag, size_t chunk_len) {
+    void* l_G;
+    uint32_t totalbytes, GCthreshold;
+    int i, new_lG;
+    char hex[GSTATE_DUMP_BYTES * 3 + 1];
+    const uint8_t* raw;
+    static const char kHex[] = "0123456789ABCDEF";
+
+    if (!L || !SafeProbe(L, LUA_OFF_L_G + 4)) return;
+    l_G = *(void**)((char*)L + LUA_OFF_L_G);
+    if (!l_G || !SafeProbe(l_G, GSTATE_DUMP_BYTES)) {
+        m2_logf("[GCDIAG] %s L=%p l_G=UNREADABLE chunk_len=%lu",
+                tag, L, (unsigned long)chunk_len);
+        return;
+    }
+
+    /* Track distinct l_G. Linear scan; bounded 32. If we exhaust 32
+     * distinct global_States the engine is DEFINITELY leaking VMs. */
+    new_lG = 1;
+    for (i = 0; i < g_gcdiag_lgCount; ++i) {
+        if (g_gcdiag_lgSeen[i] == l_G) { new_lG = 0; break; }
+    }
+    if (new_lG && g_gcdiag_lgCount < GCDIAG_LG_SLOTS) {
+        g_gcdiag_lgSeen[g_gcdiag_lgCount++] = l_G;
+    }
+
+    GCthreshold = *(uint32_t*)((char*)l_G + GSTATE_OFF_GCTHRESHOLD);
+    totalbytes  = *(uint32_t*)((char*)l_G + GSTATE_OFF_TOTALBYTES);
+
+    /* Raw hex dump of the first GSTATE_DUMP_BYTES of *l_G. If our
+     * offsets are wrong, whoever reads the log can eyeball which u32
+     * is the one that climbs. Space-separated so wvsprintfA is happy. */
+    raw = (const uint8_t*)l_G;
+    for (i = 0; i < GSTATE_DUMP_BYTES; ++i) {
+        hex[i * 3 + 0] = kHex[(raw[i] >> 4) & 0xF];
+        hex[i * 3 + 1] = kHex[raw[i] & 0xF];
+        hex[i * 3 + 2] = (i + 1 == GSTATE_DUMP_BYTES) ? '\0' : ' ';
+    }
+
+    m2_logf("[GCDIAG] %s L=%p l_G=%p new_lG=%d distinct_lG=%d "
+            "totalbytes=%lu KB GCthreshold=%lu KB chunk_len=%lu",
+            tag, L, l_G, new_lG, g_gcdiag_lgCount,
+            (unsigned long)(totalbytes / 1024),
+            (unsigned long)(GCthreshold / 1024),
+            (unsigned long)chunk_len);
+    m2_logf("[GCDIAG] %s l_G_dump=%s", tag, hex);
+}
+
 /* Identifies a lua_State by tt-byte at +4 (LUA_TTHREAD = 8) plus
  * structural checks. Filters out C++ this-pointers that the shared
  * noop stub gets called with from engine code. */
@@ -938,7 +1021,9 @@ static void LuaDoStringEx(void* L, const char* code, size_t code_len,
     if (top_slot != new_base) memcpy(new_base, top_slot, TVALUE_SIZE);
     *top_ptr = new_base + TVALUE_SIZE;
 
+    GcDiagLog(L, "pre-pcall", code_len);
     pcall_n = SafeCallLuaCFunction(p_luaB_pcall, L);
+    GcDiagLog(L, "post-pcall", code_len);
 
     /* Read the status from where this build actually leaves it, BEFORE the
      * frame is put back. Recorded but not yet trusted for the [ok]/[runtime]
@@ -1304,6 +1389,7 @@ static void CaptureL(void* L, const char* via) {
     g_seenLNext = (g_seenLNext + 1) % SEEN_L_SLOTS;
 
     m2_logf("[+] lua_bridge: Lua VM captured via %s: L=%p", via, L);
+    GcDiagLog(L, "capture", 0);
     RegisterTcpLib(L);
     RegisterLoaderLib(L);
     RegisterMathLib(L);
